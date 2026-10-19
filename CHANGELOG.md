@@ -24,8 +24,11 @@
 - `RemoteAgent.stream()`: SSE events as `Event(kind, payload)` (`status`/`artifact`/
   `message`, plain dicts marked `untrusted`), in order, through an `EventStream` with its
   own trace; capped by `policy.timeout` (whole stream) and `policy.max_events`
-  (`A2ATimeout`), stops after the first final status, closes the remote stream on early
-  exit. Parts the policy does not accept are dropped and traced, as in `send()`.
+  (`A2ATimeout`), stops after the first final status, closes the remote stream on
+  `async with` exit or `aclose()`. Parts the policy does not accept are dropped and
+  traced per event: status events are always emitted, artifact/message events with
+  nothing accepted are dropped, and `PolicyRejected` only if the task completes having
+  sent nothing acceptable. A closed `RemoteAgent` refuses streams created before closing.
 - `RemoteAgent.reply(task_id, text)` continues a task that asked for input, and
   `RemoteAgent.cancel(task_id)`. A confirmation is never answered automatically: `send()`
   returns `input_required` and `stream()` emits it and ends.

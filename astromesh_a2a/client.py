@@ -43,6 +43,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import dataclass
 from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -93,6 +94,19 @@ _FINAL_STATES = frozenset(
     }
 )
 _T = TypeVar("_T")
+
+
+class _ClosedError(RuntimeError):
+    """The RemoteAgent was closed (passes through unchanged, never translated)."""
+
+
+@dataclass
+class _StreamParts:
+    """Per-stream part bookkeeping: was anything accepted, what was rejected first."""
+
+    accepted: bool = False
+    rejected: str | None = None
+
 
 if sys.version_info >= (3, 11):
     _deadline = asyncio.timeout
@@ -260,7 +274,7 @@ class RemoteAgent:
 
     def _check_open(self) -> None:
         if self._closed:
-            raise RuntimeError("RemoteAgent is closed")
+            raise _ClosedError("RemoteAgent is closed")
 
     # ---- card -------------------------------------------------------------------
 
@@ -278,6 +292,7 @@ class RemoteAgent:
 
     async def _vetted_card(self, trace: Trace) -> AgentCard:
         async with self._lock:
+            self._check_open()  # aclose() may have run while we waited for the lock
             now = time.monotonic()
             if self._card is not None and now - self._card_at < self.policy.card_ttl:
                 trace.add("card", url=self._fetch_url, cached=True)
@@ -285,6 +300,7 @@ class RemoteAgent:
             previous = self._interface
             self._card = None  # a refresh that fails the checks leaves no stale card behind
             card = await self._load_card(trace)
+            self._check_open()  # closed during the fetch: do not resurrect clients
             if previous is not None:  # refreshed: rebuild the SDK clients over the new card
                 self._clients = {}
                 assert self._interface is not None
@@ -350,6 +366,7 @@ class RemoteAgent:
 
     def _sdk_client(self, *, streaming: bool) -> Any:
         """SDK client over our pinned httpx client (one per streaming mode, reused)."""
+        self._check_open()
         if streaming not in self._clients:
             assert self._card is not None
             assert self._interface is not None
@@ -403,7 +420,12 @@ class RemoteAgent:
         return self._to_result(final, trace)
 
     async def cancel(self, task_id: str) -> None:
-        """Ask the remote to cancel a task. ``TaskFailed`` if it already ended otherwise."""
+        """Ask the remote to cancel a task.
+
+        Returns once the remote accepts the request: the task comes back ``canceled``, or
+        still ``working`` when the remote cancels asynchronously (it may yet finish).
+        ``TaskFailed`` if the task already ended in another final state.
+        """
         self._check_open()
         if not isinstance(task_id, str) or not task_id:
             raise ValueError("task_id must be a non-empty str")
@@ -420,7 +442,18 @@ class RemoteAgent:
         input_required, auth_required) or a message. A failed/canceled task is an event,
         not an error. Capped by ``policy.timeout`` (whole stream, wall-clock) and
         ``policy.max_events``: past either, ``A2ATimeout`` and the stream is closed.
-        Use as ``async for event in agent.stream(...)``.
+        The seconds charged to the budget are wall-clock from start to end of the stream,
+        including the caller's own time between events.
+
+        Parts the policy does not accept are dropped and traced: a status event is always
+        emitted (empty ``text``/``data`` if its parts were dropped); an artifact or message
+        event with nothing accepted is dropped. If the task completes having sent only
+        rejected parts, ``PolicyRejected("part_kind:<kind>")`` instead of the completion.
+
+        Use as ``async with agent.stream(...) as events: async for event in events``.
+        Leaving early (``break``) only closes the remote stream when the ``async with``
+        exits or ``aclose()`` is called; a bare ``async for`` + ``break`` leaves it to the
+        garbage collector.
         """
         self._check_open()
         trace = Trace()
@@ -447,7 +480,7 @@ class RemoteAgent:
             except TimeoutError:
                 cut = True
                 raise A2ATimeout(f"remote call exceeded {limit:g}s") from None
-            except A2AError:
+            except (A2AError, _ClosedError):
                 raise
             except Exception as exc:  # noqa: BLE001 - translated below, never passed through
                 failure = exc
@@ -522,6 +555,7 @@ class RemoteAgent:
     async def _stream(
         self, text: str, context_id: str | None, trace: Trace
     ) -> AsyncIterator[Event]:
+        self._check_open()
         self._meter.admit()
         limit = self._limit()
         started = time.monotonic()
@@ -529,6 +563,7 @@ class RemoteAgent:
         deadline = started + limit
         events: Any = None
         count = 0
+        parts = _StreamParts()
         try:
             try:
                 async with _deadline(limit):
@@ -553,16 +588,15 @@ class RemoteAgent:
                     count += 1
                     if count > self.policy.max_events:
                         raise A2ATimeout(f"stream exceeded {self.policy.max_events} events")
-                    stop = False
-                    for event in self._to_events(raw, trace):
-                        stop = stop or event.kind == "message" or event.payload.get("final")
+                    out, stop = self._to_events(raw, trace, parts)
+                    for event in out:
                         yield event
                     if stop:
                         break
             except TimeoutError:
                 cut = True
                 raise A2ATimeout(f"stream exceeded {limit:g}s") from None
-            except A2AError:
+            except (A2AError, _ClosedError):
                 raise
             except Exception as exc:  # noqa: BLE001 - translated below, never passed through
                 failure = exc
@@ -578,32 +612,55 @@ class RemoteAgent:
 
     # ---- events -----------------------------------------------------------------
 
-    def _to_events(self, raw: StreamResponse, trace: Trace) -> list[Event]:
+    def _to_events(
+        self, raw: StreamResponse, trace: Trace, parts: _StreamParts
+    ) -> tuple[list[Event], bool]:
+        """Our events for one SDK event, and whether the stream ends with it."""
         kind = raw.WhichOneof("payload")
         if kind == "task":
             task = raw.task
             out = [
-                self._artifact_event(a, task.id, task.context_id, False, True, trace)
+                self._artifact_event(a, task.id, task.context_id, False, True, trace, parts)
                 for a in task.artifacts
             ]
-            out.append(self._status_event(task.status, task.id, task.context_id, trace))
-            return out
+            status = self._status_event(task.status, task.id, task.context_id, trace, parts)
+            return [e for e in (*out, status) if e is not None], status.payload["final"]
         if kind == "status_update":
             u = raw.status_update
-            return [self._status_event(u.status, u.task_id, u.context_id, trace)]
+            status = self._status_event(u.status, u.task_id, u.context_id, trace, parts)
+            return [status], status.payload["final"]
         if kind == "artifact_update":
             a = raw.artifact_update
-            return [
-                self._artifact_event(
-                    a.artifact, a.task_id, a.context_id, a.append, a.last_chunk, trace
-                )
-            ]
+            event = self._artifact_event(
+                a.artifact, a.task_id, a.context_id, a.append, a.last_chunk, trace, parts
+            )
+            return ([event] if event else []), False
         if kind == "message":
             m = raw.message
             trace.add("message", task_id=m.task_id or None, parts=len(m.parts))
-            text, data = self._accept(m.parts, trace)
-            return [Event("message", self._payload(m.task_id, m.context_id, text, data))]
+            text, data = self._stream_parts(m.parts, trace, parts, content=True)
+            self._check_completion(parts)  # a message ends the stream
+            if not (text or data) and m.parts:
+                return [], True
+            return [Event("message", self._payload(m.task_id, m.context_id, text, data))], True
         raise TaskFailed(f"unexpected stream event {kind!r}")
+
+    def _stream_parts(
+        self, raw_parts: Any, trace: Trace, parts: _StreamParts, *, content: bool
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """``_accept_parts`` plus the stream's bookkeeping (never raises for kinds)."""
+        text, data, rejected = self._accept_parts(raw_parts, trace)
+        if rejected and parts.rejected is None:
+            parts.rejected = rejected[0]
+        if content and (text or data):
+            parts.accepted = True
+        return text, data
+
+    @staticmethod
+    def _check_completion(parts: _StreamParts) -> None:
+        """At completion: only rejected parts ever arrived → ``PolicyRejected``."""
+        if parts.rejected is not None and not parts.accepted:
+            raise PolicyRejected(f"part_kind:{parts.rejected}")
 
     def _payload(
         self, task_id: str, context_id: str, text: str, data: list[dict[str, Any]]
@@ -618,11 +675,20 @@ class RemoteAgent:
         }
 
     def _status_event(
-        self, status: TaskStatus, task_id: str, context_id: str, trace: Trace
+        self,
+        status: TaskStatus,
+        task_id: str,
+        context_id: str,
+        trace: Trace,
+        parts: _StreamParts,
     ) -> Event:
         state = _state_name(status.state)
         trace.add("status", state=state, task_id=task_id or None)
-        text, data = self._accept(status.message.parts, trace)
+        completed = status.state == TaskState.TASK_STATE_COMPLETED
+        # As in send(): a completion's own message counts as content.
+        text, data = self._stream_parts(status.message.parts, trace, parts, content=completed)
+        if completed:
+            self._check_completion(parts)
         payload = self._payload(task_id, context_id, text, data)
         payload.update(state=state, final=status.state in _FINAL_STATES)
         return Event("status", payload)
@@ -635,10 +701,13 @@ class RemoteAgent:
         append: bool,
         last_chunk: bool,
         trace: Trace,
-    ) -> Event:
+        parts: _StreamParts,
+    ) -> Event | None:
         artifact_id = artifact.artifact_id or None
         trace.add("artifact", artifact_id=artifact_id, parts=len(artifact.parts))
-        text, data = self._accept(artifact.parts, trace)
+        text, data = self._stream_parts(artifact.parts, trace, parts, content=True)
+        if not (text or data) and artifact.parts:
+            return None  # nothing accepted: dropped (the rejection is in the trace)
         payload = self._payload(task_id, context_id, text, data)
         payload.update(
             artifact_id=artifact_id,
@@ -712,6 +781,15 @@ class RemoteAgent:
         ``rejection``); ``PolicyRejected`` only when parts existed and none was accepted.
         An oversized part is always a hard ``PolicyRejected("part_size")``.
         """
+        text, data, rejected = self._accept_parts(parts, trace)
+        if rejected and not text and not data:
+            raise PolicyRejected(f"part_kind:{rejected[0]}")
+        return text, data
+
+    def _accept_parts(
+        self, parts: Any, trace: Trace
+    ) -> tuple[str, list[dict[str, Any]], list[str]]:
+        """Like ``_accept`` but never raises for rejected kinds: also returns them."""
         texts: list[str] = []
         data: list[dict[str, Any]] = []
         rejected: list[str] = []
@@ -753,9 +831,7 @@ class RemoteAgent:
                         }
                     }
                 )
-        if rejected and not texts and not data:
-            raise PolicyRejected(f"part_kind:{rejected[0]}")
-        return "\n".join(texts), data
+        return "\n".join(texts), data, rejected
 
 
 def _select_interface(card: AgentCard) -> AgentInterface:

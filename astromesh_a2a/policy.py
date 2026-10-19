@@ -16,7 +16,14 @@ from astromesh_a2a.errors import PolicyRejected
 
 @dataclass(frozen=True)
 class Budget:
-    """Cap on calls and/or wall-clock seconds spent on one remote."""
+    """Cap on calls and/or wall-clock seconds spent on one remote.
+
+    Seconds are wall-clock per call; for ``stream()`` that is start to end of the stream,
+    including the caller's own time between events. A call is admitted only while some
+    seconds are left and its deadline is capped at what is left, but concurrent calls on
+    the same remote each see the same remainder: under concurrency the seconds cap is
+    soft (it can be overrun by up to the calls in flight). ``max_calls`` is exact.
+    """
 
     max_calls: int | None = None
     max_seconds: float | None = None
@@ -38,8 +45,10 @@ class Policy:
 
     ``max_bytes`` caps every response body and every part. A stream (SSE) is capped at
     ``max_stream_bytes`` in total and ``max_bytes`` per event, and also by ``timeout``
-    (wall-clock for the whole stream) and ``max_events``. The vetted card is cached for
-    ``card_ttl`` seconds, then fetched and vetted again.
+    (wall-clock for the whole stream) and ``max_events``. SSE lines must end in LF (or
+    CRLF): a stream framed with bare CR reads as one oversized event and is refused
+    (``BlockedDestination``). The vetted card is cached for ``card_ttl`` seconds, then
+    fetched and vetted again.
     """
 
     allowed: tuple[str, ...] = ()

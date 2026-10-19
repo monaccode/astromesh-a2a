@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -66,6 +67,46 @@ async def test_stream_descarta_partes_no_aceptadas(server, loopback):
     assert [e["reason"] for e in stream.trace if e["stage"] == "rejection"] == ["part_kind:file"]
 
 
+async def test_stream_artefacto_rechazado_no_corta(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        stream = agent.stream("filethen")
+        events = await _collect(stream)
+    assert [e.payload["text"] for e in events if e.kind == "artifact"] == ["ok"]
+    assert events[-1].payload["state"] == "completed"
+    assert [e["reason"] for e in stream.trace if e["stage"] == "rejection"] == ["part_kind:file"]
+
+
+async def test_stream_solo_rechazadas_falla_al_completar(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        seen = []
+        with pytest.raises(PolicyRejected) as exc:
+            seen.extend([e async for e in agent.stream("file")])
+    assert exc.value.reason == "part_kind:file"
+    assert seen == []
+
+
+async def test_status_con_partes_rechazadas_se_emite(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        stream = agent.stream("askfile")
+        events = await _collect(stream)
+    last = events[-1]
+    assert last.kind == "status"
+    assert last.payload["state"] == "input_required"
+    assert last.payload["text"] == "which?"
+    assert any(e["stage"] == "rejection" for e in stream.trace)
+
+
+async def test_stream_tras_cerrar_el_agente(server, loopback):
+    agent = RemoteAgent(server.base, policy=_policy())
+    events = agent.stream("hi")
+    await agent.aclose()
+    with pytest.raises(RuntimeError, match="closed"):
+        await events.__anext__()
+    assert agent._card_http is None
+    assert agent._rpc_http is None
+    assert server.requests == []
+
+
 @pytest.mark.parametrize(
     ("policy_kw", "why"),
     [({"max_events": 5}, "events"), ({"timeout": 0.3}, "s")],
@@ -84,13 +125,55 @@ async def test_stream_infinito_corta(server, loopback, policy_kw, why):
     assert seen == []  # the stream raised: the list was never filled
 
 
+async def _settle(server) -> None:
+    """Wait until connections left by earlier tests are gone (count stable 0.2 s)."""
+    last, stable_since = server.connections(), time.monotonic()
+    while time.monotonic() - stable_since < 0.2:
+        await asyncio.sleep(0.02)
+        now = server.connections()
+        if now != last:
+            last, stable_since = now, time.monotonic()
+
+
+async def _closed_one(server, before: int, within: float = 1.0) -> bool:
+    """Did the server lose a TCP connection (from ``before``) within ``within`` seconds?
+
+    ``forever`` runs for seconds and the agent stays open (its pool keeps idle connections),
+    so a connection dropping this soon can only be the half-read stream being closed.
+    """
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if server.connections() < before:
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
 async def test_stream_parada_temprana_cierra(server, loopback):
+    await _settle(server)
     async with RemoteAgent(server.base, policy=_policy()) as agent:
         async with agent.stream("forever") as events:
             async for event in events:
                 assert event.kind == "status"
                 break
+            before = server.connections()
+        assert await _closed_one(server, before)
         assert (await agent.send("hi")).answer == "echo:hi"
+
+
+async def test_stream_break_y_aclose_cierra(server, loopback):
+    # A bare ``async for`` + ``break`` leaves closing to the GC (documented in stream());
+    # an explicit aclose() closes the remote stream deterministically.
+    await _settle(server)
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        events = agent.stream("forever")
+        async for _ in events:
+            break
+        await asyncio.sleep(0)
+        before = server.connections()
+        assert not await _closed_one(server, before, within=0.3)  # still open: held ref
+        await events.aclose()
+        assert await _closed_one(server, before)
 
 
 # ---- body caps on SSE ----------------------------------------------------------------
@@ -270,6 +353,17 @@ async def test_card_ttl_refresca_y_revalida(server, loopback):
     paths = [r["path"] for r in server.requests]
     assert paths.count("/ttl/agent-card.json") == 4
     assert paths.count("/a2a") == 2
+
+
+async def test_card_ttl_refresco_a_host_no_permitido(server, loopback):
+    url = server.base + "/ttl/agent-card.json"
+    async with RemoteAgent(url, policy=_policy(card_ttl=0.0)) as agent:
+        assert (await agent.send("hi")).answer == "echo:hi"
+        server.ttl_rpc_base = "http://evil.example:9"
+        with pytest.raises(PolicyRejected) as exc:
+            await agent.send("hi")
+    assert exc.value.reason == "interface:host_not_allowed"
+    assert [r["path"] for r in server.requests].count("/a2a") == 1
 
 
 def test_card_ttl_negativo():

@@ -7,8 +7,11 @@ once per test session. It serves several cards from one app:
 - ``/v03/agent-card.json``: same agent, but its only interface says protocol 0.3.
 - ``/other-host/agent-card.json``: interface on ``localhost`` (card is on 127.0.0.1).
 - ``/signed/agent-card.json``: the echo card signed with ``SIGNING_KEY`` (HS256, kid k1).
-- ``/ttl/agent-card.json``: the echo card, its protocol version read from
-  ``server.ttl_version`` on every fetch (to test card refresh).
+- ``/ttl/agent-card.json``: the echo card, its protocol version and RPC base read from
+  ``server.ttl_version``/``server.ttl_rpc_base`` on every fetch (to test card refresh).
+
+``server.connections()`` counts the TCP connections uvicorn has open, so tests can prove
+the client really closed a stream (an abandoned, half-read stream keeps its connection).
 
 ``server.requests`` records every HTTP request (method, path, headers) and
 ``server.seen`` what the executor received (text, message/request metadata), so tests
@@ -60,11 +63,17 @@ class RefServer:
     requests: list[dict[str, Any]] = field(default_factory=list)
     seen: list[dict[str, Any]] = field(default_factory=list)
     ttl_version: str = "1.0"
+    ttl_rpc_base: str | None = None
+    uv: Any = None
+
+    def connections(self) -> int:
+        return len(self.uv.server_state.connections)
 
     def reset(self) -> None:
         self.requests.clear()
         self.seen.clear()
         self.ttl_version = "1.0"
+        self.ttl_rpc_base = None
 
     def rpc_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["method"] == "POST"]
@@ -135,6 +144,11 @@ class EchoExecutor(AgentExecutor):
         if text == "askfile":
             await up.requires_input(up.new_agent_message([file_part, new_text_part("which?")]))
             return
+        if text == "filethen":
+            await up.add_artifact([file_part], name="file")
+            await up.add_artifact([new_text_part("ok")], name="answer")
+            await up.complete()
+            return
         if text == "mixed":
             await up.add_artifact([new_text_part("see file"), file_part], name="answer")
         elif text == "file":
@@ -199,7 +213,7 @@ def build_app(server: RefServer) -> Any:
     port = base.rsplit(":", 1)[1]
 
     async def _ttl_card(_: AgentCard) -> AgentCard:
-        return _card(base, version=server.ttl_version)
+        return _card(base, version=server.ttl_version, rpc_base=server.ttl_rpc_base)
 
     handler = DefaultRequestHandler(
         agent_executor=EchoExecutor(server), task_store=InMemoryTaskStore(), agent_card=card
@@ -227,6 +241,7 @@ def ref_server():
     port = sock.getsockname()[1]
     server = RefServer(base=f"http://127.0.0.1:{port}")
     uv = uvicorn.Server(uvicorn.Config(build_app(server), log_level="warning", lifespan="off"))
+    server.uv = uv
     thread = threading.Thread(target=lambda: asyncio.run(uv.serve(sockets=[sock])), daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
