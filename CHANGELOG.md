@@ -40,3 +40,25 @@
   and per event at `max_bytes` (in `net.PinnedTransport`); other bodies keep `max_bytes`.
 - `Policy.card_ttl` (default 300 s): the card is fetched and vetted again after it
   expires; a refresh that fails the checks leaves no stale card behind.
+- Server: `create_app(handler, card, auth=...)` (Starlette, mountable) and `serve(...)`
+  (uvicorn; `server` extra, imported lazily) expose any async agent as an A2A agent on the
+  official SDK: card at `/.well-known/agent-card.json` built from `CardSpec`/`Skill`,
+  JSON-RPC 1.0 (blocking and SSE) at `/a2a`. Auth is mandatory: the `auth` callable
+  (`api_key_auth(env, header)`, constant-time, fail closed when the env var is unset, or any
+  `async (Request) -> bool | str`) runs before the SDK and refuses with `401` JSON; without
+  it `create_app`/`serve` raise `ValueError` unless `insecure=True`. Request bodies over
+  `max_body_bytes` (default 1 MiB) answer `413`. Only `A2A-Version: 1.x` is served (missing
+  header = 0.3 → `-32009`).
+- `Incoming`/`Outgoing`: every incoming message reaches the handler as `Origin.AGENT`,
+  `untrusted=True`, whatever the remote claims (`claimed_origin` kept for logging only);
+  file parts are dropped. `Outgoing.needs_confirmation` puts the task in `input_required`;
+  the remote's reply comes back as untrusted input and the library never marks anything
+  as confirmed. A handler exception fails the task with a generic message; details stay
+  in the local log.
+
+### Changed
+
+- **Breaking:** `RemoteAgent.card()` returns a frozen `RemoteCard` (`name`, `description`,
+  `version`, `interface_url`, `protocol_version`, `streaming`, `signed`, `skills` as
+  `Skill`s) instead of the SDK protobuf `AgentCard`; `RemoteCard.raw` keeps a copy of the
+  vetted protobuf.

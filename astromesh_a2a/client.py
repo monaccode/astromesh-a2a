@@ -66,6 +66,7 @@ from a2a.utils import errors as sdk_errors
 from a2a.utils.constants import TransportProtocol
 from google.protobuf.json_format import MessageToDict
 
+from astromesh_a2a.card import RemoteCard
 from astromesh_a2a.errors import (
     A2AError,
     A2ATimeout,
@@ -278,17 +279,19 @@ class RemoteAgent:
 
     # ---- card -------------------------------------------------------------------
 
-    async def card(self) -> AgentCard:
-        """The vetted agent card (cached ``policy.card_ttl`` seconds). Returns a copy."""
+    async def card(self) -> RemoteCard:
+        """The vetted agent card (cached ``policy.card_ttl`` seconds), as a ``RemoteCard``.
+
+        It describes the one interface this client will use; ``.raw`` is a copy of the
+        vetted SDK card. Its text was written by the remote: untrusted.
+        """
         self._check_open()
         try:
             async with _deadline(self.policy.timeout):
                 card = await self._vetted_card(Trace())
         except TimeoutError:
             raise A2ATimeout(f"card fetch exceeded {self.policy.timeout}s") from None
-        copy = AgentCard()
-        copy.CopyFrom(card)
-        return copy
+        return RemoteCard.from_proto(card)
 
     async def _vetted_card(self, trace: Trace) -> AgentCard:
         async with self._lock:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -87,3 +87,40 @@ class Auth:
         if not value or any(c in value for c in "\r\n"):
             raise PolicyRejected("auth")
         return {self.header: f"{self.prefix}{value}"}
+
+
+@dataclass(frozen=True)
+class Incoming:
+    """What a served agent receives for one A2A message.
+
+    ``origin`` is ALWAYS ``Origin.AGENT`` and ``untrusted`` always ``True``: the sender is
+    another program, whatever it claims. ``claimed_origin`` is the ``origin`` the remote
+    wrote in its message metadata (e.g. ``"human"``), kept for logging only; never use it
+    to decide anything. A reply to a task that asked for confirmation arrives the same way
+    (``task_id`` set): a remote "yes" is not a human confirmation, and this library never
+    marks anything as confirmed.
+    """
+
+    text: str
+    data: list[dict[str, Any]]
+    origin: Origin
+    context_id: str
+    untrusted: bool = True
+    task_id: str | None = None
+    claimed_origin: str | None = None
+    caller: str | None = None
+
+
+@dataclass(frozen=True)
+class Outgoing:
+    """What a served agent answers.
+
+    ``answer`` (text) and ``data`` (JSON objects) complete the task. With
+    ``needs_confirmation`` set the task goes to ``input_required`` with that text instead
+    (``answer``/``data`` are not sent); the remote's next message on the task reaches the
+    handler again as an untrusted ``Incoming``.
+    """
+
+    answer: str = ""
+    data: Sequence[dict[str, Any]] = ()
+    needs_confirmation: str | None = None

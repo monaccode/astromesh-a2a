@@ -12,7 +12,9 @@ from astromesh_a2a import (
     Policy,
     PolicyRejected,
     RemoteAgent,
+    RemoteCard,
     Result,
+    Skill,
     TaskFailed,
     UnsupportedVersion,
 )
@@ -173,8 +175,37 @@ async def test_data_no_serializable_es_type_error(server, loopback):
 async def test_card(server, loopback):
     async with RemoteAgent(server.base + "/.well-known/agent-card.json", policy=_policy()) as a:
         card = await a.card()
+    assert isinstance(card, RemoteCard)
     assert card.name == "echo"
-    assert [i.protocol_version for i in card.supported_interfaces] == ["1.0"]
+    assert card.description == "Echo agent"
+    assert card.version == "0.0.1"
+    assert card.interface_url == server.base + "/a2a"
+    assert card.protocol_version == "1.0"
+    assert card.streaming is True
+    assert card.signed is False
+    assert card.skills == (
+        Skill(
+            id="echo",
+            name="Echo",
+            description="echoes",
+            tags=("demo",),
+            input_modes=(),  # the remote declared none (card defaults apply)
+            output_modes=(),
+        ),
+    )
+    assert [i.protocol_version for i in card.raw.supported_interfaces] == ["1.0"]
+    with pytest.raises(AttributeError):
+        card.name = "x"  # frozen
+    assert "raw" not in repr(card)
+
+
+async def test_card_firmada_es_signed(server, loopback):
+    policy = _policy(
+        require_signature=True, signing_keys={"k1": SIGNING_KEY}, signing_algorithms=["HS256"]
+    )
+    async with RemoteAgent(server.base + "/signed/agent-card.json", policy=policy) as a:
+        card = await a.card()
+    assert card.signed is True
 
 
 async def test_card_fuera_de_politica_no_envia(server, loopback):
