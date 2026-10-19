@@ -463,6 +463,22 @@ class RemoteAgent:
         trace = Trace()
         return EventStream(self._stream(text, context_id, trace), trace)
 
+    # ---- adapters -----------------------------------------------------------------
+
+    def as_tool(
+        self, framework: str, *, name: str | None = None, description: str | None = None
+    ) -> Any:
+        """This agent as a native tool of ``framework`` (``"langchain"``, ``"crewai"``,
+        ``"adk"``, ``"openai-agents"``, ``"pydantic-ai"``...; needs that extra).
+
+        ``name``/``description`` default to the card: ``await agent.card()`` first, or
+        pass both. The tool keeps one conversation (and a pending task): build one per
+        conversation. See ``astromesh_a2a.adapters``.
+        """
+        from astromesh_a2a.adapters import as_tool
+
+        return as_tool(self, framework, name=name, description=description)
+
     # ---- plumbing -----------------------------------------------------------------
 
     def _limit(self) -> float:

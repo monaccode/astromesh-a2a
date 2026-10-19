@@ -60,6 +60,19 @@
   300 s), fails the task with a generic message; details stay in the local log.
 - `create_app`/`serve` take `task_store=` (default: the SDK's unbounded in-memory store);
   the app's lifespan closes the SDK request handler on shutdown.
+- `RemoteAgent.as_tool(framework, *, name=None, description=None)` and
+  `astromesh_a2a.adapters`: a remote agent as a native tool of LangChain
+  (`StructuredTool`), CrewAI (`BaseTool`), Google ADK (`FunctionTool`), OpenAI Agents SDK
+  (`function_tool`) and PydanticAI (`Tool`); frameworks are imported on first use and a
+  missing one raises `MissingExtraError` naming the extra. One input, `query`; the tool
+  object keeps the conversation and replies to a task waiting for input (one tool per
+  conversation). The output is `wrap_untrusted()`: the remote's words inside
+  `<remote-agent-output untrusted="true" ...>` with `<`/`>`/`&` escaped, and for a
+  pending task its `task_id` plus a note that only the user may answer it. Errors use
+  each framework's tool-error convention with a safe message. Name and description
+  default to the cached card (the remote's description quoted as untrusted). Sync calls
+  run on one background event loop (`run_sync`); a sync call inside a running loop is
+  refused. CI gains an `adapters` job with every extra installed.
 
 ### Changed
 
