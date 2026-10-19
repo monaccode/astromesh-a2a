@@ -469,7 +469,8 @@ class RemoteAgent:
         self, framework: str, *, name: str | None = None, description: str | None = None
     ) -> Any:
         """This agent as a native tool of ``framework`` (``"langchain"``, ``"crewai"``,
-        ``"adk"``, ``"openai-agents"``, ``"pydantic-ai"``...; needs that extra).
+        ``"adk"``, ``"openai-agents"``, ``"pydantic-ai"``, ``"llamaindex"``,
+        ``"smolagents"``, ``"agent-framework"``, ``"mcp"``; needs that extra).
 
         ``name``/``description`` default to the card: ``await agent.card()`` first, or
         pass both. The tool keeps one conversation (and a pending task): build one per

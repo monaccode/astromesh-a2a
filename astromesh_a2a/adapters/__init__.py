@@ -12,10 +12,18 @@ crewai             ``BaseTool`` (``run`` + ``arun``)        exception
 adk                ``FunctionTool`` (async)                ``{"error": ...}``
 openai-agents      ``FunctionTool`` (async)                ``failure_error_function``
 pydantic-ai        ``Tool`` (async)                        ``ModelRetry``
+llamaindex         ``FunctionTool`` (sync + async)         exception
+smolagents         ``Tool`` (sync)                         exception
+agent-framework    ``FunctionTool`` (async)                exception
+mcp                FastMCP ``Tool`` (async)                ``ToolError``
 =================  =====================================  ===========================
 
 The tool takes one ``query: str`` and keeps the conversation (and a pending task) on
 the tool object: one tool per conversation. See ``astromesh_a2a.adapters._common``.
+``astromesh_a2a.adapters.mcp.build_server`` serves the tool as a whole MCP server.
+
+The other way round, ``astromesh_a2a.adapters.server_langchain.handler_from_runnable``
+turns a LangChain runnable into a ``serve()`` handler.
 """
 
 from __future__ import annotations
@@ -47,6 +55,10 @@ FRAMEWORKS = {
     "adk": "adk",
     "openai-agents": "openai_agents",
     "pydantic-ai": "pydantic_ai",
+    "llamaindex": "llamaindex",
+    "smolagents": "smolagents",
+    "agent-framework": "agent_framework",
+    "mcp": "mcp",
 }
 
 

@@ -73,6 +73,14 @@
   default to the cached card (the remote's description quoted as untrusted). Sync calls
   run on one background event loop (`run_sync`); a sync call inside a running loop is
   refused. CI gains an `adapters` job with every extra installed.
+- Adapters for LlamaIndex (`FunctionTool`, sync + async), smolagents (`Tool`), Microsoft
+  Agent Framework (`FunctionTool`) and MCP (a FastMCP `Tool`; `adapters.mcp.build_server`
+  serves it as a whole MCP server, failures as `isError` results).
+- `adapters.server_langchain.handler_from_runnable(runnable, *, input_key="auto")`: a
+  LangChain runnable as a `serve()` handler. Input follows the runnable's schema (the
+  text, `{"messages": [...]}` for graphs, the single required field, or `{"input": ...}`),
+  `configurable.thread_id` is `Incoming.session_key`; messages, `{"messages": ...}` and
+  `{"output": ...}` results become the answer, other dicts become `data`.
 
 ### Changed
 
