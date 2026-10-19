@@ -5,7 +5,7 @@ import json
 import pytest
 from _fake import INJECTION, FakeAgent, asking, done
 
-from astromesh_a2a import A2ATimeout, TaskFailed
+from astromesh_a2a import A2ATimeout, PolicyRejected, TaskFailed
 from astromesh_a2a.adapters import (
     MissingExtraError,
     RemoteTool,
@@ -181,10 +181,22 @@ def test_remote_tool_error_keeps_error_type():
     assert err.error_type is A2ATimeout
 
 
-async def test_unclassified_task_failed_keeps_pending():
-    agent = FakeAgent(asking(task_id="t-1"), TaskFailed("remote answered HTTP 502"), done())
+async def test_any_task_failed_drops_pending_but_timeouts_keep_it():
+    agent = FakeAgent(
+        asking(task_id="t-1"),
+        A2ATimeout("remote call exceeded 60s"),
+        PolicyRejected("budget"),
+        TaskFailed("remote answered HTTP 502"),
+        done(),
+    )
     tool = RemoteTool.for_agent(agent, None, None)
     await tool.acall("pay")
+    for _ in range(2):
+        with pytest.raises(RemoteToolError):
+            await tool.acall("yes")
+        assert tool.pending_task_id == "t-1"  # nothing was answered: still waiting
     with pytest.raises(RemoteToolError):
         await tool.acall("yes")
-    assert tool.pending_task_id == "t-1"  # not reported ended by the remote
+    assert tool.pending_task_id is None  # never stuck replying to a dead task
+    await tool.acall("again")
+    assert agent.calls[-1] == ("send", "again", "ctx-1")

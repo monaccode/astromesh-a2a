@@ -385,3 +385,15 @@ async def test_loop_binding_error_is_not_translated(server, loopback):
         await agent.card()
         with pytest.raises(LoopBindingError, match="bound to another event loop"):
             await asyncio.to_thread(asyncio.run, agent.send("hi"))
+
+
+def test_task_gone_errors_are_remote_task_failed():
+    from a2a.utils import errors as sdk_errors
+
+    from astromesh_a2a.client import _translate
+
+    for cls in (sdk_errors.TaskNotFoundError, sdk_errors.UnsupportedOperationError):
+        err = _translate(cls("task t-1 secret remote text"))
+        assert isinstance(err, TaskFailed)
+        assert err.remote is True
+        assert "secret" not in str(err)

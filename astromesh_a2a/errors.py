@@ -25,7 +25,7 @@ class TaskFailed(A2AError):  # noqa: N818
     """The remote task failed, or the call to it failed in a way we could not classify.
 
     ``remote`` is ``True`` only when the remote itself reported the task as ended
-    (failed, rejected, canceled, not cancelable): the task is over. ``False`` for an
+    (failed, rejected, canceled, not found, not cancelable): the task is over. ``False`` for an
     unclassified failure (an HTTP error, an unexpected SDK exception...), whose message is
     generic and never quotes the remote: the task may still be alive.
     """

@@ -93,7 +93,12 @@
   `LoopBindingError` (a local `RuntimeError`, never translated). Any other unexpected
   exception during an RPC (e.g. an SDK bug on a malformed response) is still a generic
   `TaskFailed` that never quotes the remote. `TaskFailed.remote` is `True` only when the
-  remote itself reported the task ended; adapters drop a pending task only then.
+  remote itself reported the task ended, including the remote's task-not-found /
+  unsupported-operation / not-cancelable errors. Adapters drop a pending task on any
+  `TaskFailed` (never stuck replying to a dead task) and keep it on timeouts and policy
+  rejections. `aclose()` from another live loop raises `LoopBindingError`. A sync
+  dispatch to a running but blocked agent loop gives up after `policy.timeout` + 5 s
+  with `LoopBindingError` instead of hanging.
 
 - **Breaking:** `RemoteAgent.card()` returns a frozen `RemoteCard` (`name`, `description`,
   `version`, `interface_url`, `protocol_version`, `streaming`, `has_signatures`,

@@ -113,6 +113,12 @@ LOOP_ERROR = "RemoteAgent is bound to another event loop; create one RemoteAgent
 # message never quotes the remote. CancelledError/KeyboardInterrupt are BaseExceptions
 # and are never caught.
 _LOCAL_SENTINELS = (A2AError, _ClosedError, LoopBindingError)
+# Remote JSON-RPC errors that mean the task is gone or cannot take this message.
+_TASK_GONE = (
+    sdk_errors.TaskNotFoundError,
+    sdk_errors.UnsupportedOperationError,
+    sdk_errors.TaskNotCancelableError,
+)
 
 
 @dataclass
@@ -279,7 +285,21 @@ class RemoteAgent:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close the HTTP clients this agent owns. Idempotent."""
+        """Close the HTTP clients this agent owns. Idempotent.
+
+        Call it on the agent's own loop (from sync code: ``run_sync(agent.aclose(),
+        agent=agent)``); from another, live loop it raises ``LoopBindingError``. If the
+        agent's loop is already closed, its connections died with it: they are dropped.
+        """
+        bound = self._loop
+        if bound is not None and bound is not asyncio.get_running_loop():
+            if not bound.is_closed():
+                raise LoopBindingError(LOOP_ERROR)
+            self._closed = True
+            self._clients = {}
+            self._card_http = self._rpc_http = None
+            self._retired = []
+            return
         self._closed = True
         self._clients = {}  # SDK clients are dropped, never closed (would close our httpx)
         owned = (self._card_http, self._rpc_http, *self._retired)
@@ -962,6 +982,9 @@ def _translate(exc: BaseException) -> A2AError:
         return PolicyRejected("content_type")
     if isinstance(exc, (A2AClientTimeoutError, httpx.TimeoutException)):
         return A2ATimeout("remote call timed out")
+    for cause in _chain(exc):
+        if isinstance(cause, _TASK_GONE):  # the remote says: no such (live) task
+            return TaskFailed(f"remote task is not available ({type(cause).__name__})", remote=True)
     for cause in _chain(exc):
         if isinstance(cause, httpx.HTTPStatusError):
             return TaskFailed(f"remote answered HTTP {cause.response.status_code}")

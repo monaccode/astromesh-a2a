@@ -1,6 +1,7 @@
 """Adapters against the in-process reference server (real ``RemoteAgent``)."""
 
 import asyncio
+import threading
 
 import pytest
 
@@ -72,3 +73,60 @@ async def test_agent_refuses_a_second_loop(server, loopback):
         await agent.card()
         with pytest.raises(LoopBindingError, match="bound to another event loop"):
             await asyncio.to_thread(asyncio.run, agent.send("hi"))
+
+
+async def test_tool_not_stuck_on_a_canceled_task(server, loopback):
+    pytest.importorskip("langchain_core")
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        await agent.card()
+        tool = agent.as_tool("langchain")
+        pending = await tool.ainvoke({"query": "ask"})
+        task_id = pending.split('task_id="', 1)[1].split('"', 1)[0]
+        await agent.cancel(task_id)  # the remote side ends the task
+        out = await tool.ainvoke({"query": "Madrid"})  # reply to a dead task: tool error
+        assert out.startswith("Remote A2A agent error (TaskFailed)")
+        assert "echo:Paris" in await tool.ainvoke({"query": "Paris"})  # a new task
+        assert "echo:Rome" in await tool.ainvoke({"query": "Rome"})
+
+
+async def test_blocked_agent_loop_is_a_clear_error(server, loopback, monkeypatch):
+    from astromesh_a2a.adapters import _common
+
+    monkeypatch.setattr(_common, "_DISPATCH_GRACE", 0.2)
+    policy = Policy(allowed=("127.0.0.1",), allow_insecure_http=True, timeout=0.5)
+    async with RemoteAgent(server.base, policy=policy) as agent:
+        await agent.card()
+        remote = _common.RemoteTool.for_agent(agent, None, None)
+        box = {}
+        finished = threading.Event()
+
+        def worker():  # a framework running the tool in a worker thread
+            try:
+                remote.call("hi")
+            except Exception as exc:  # noqa: BLE001 - inspected below
+                box["error"] = exc
+            finally:
+                finished.set()
+
+        threading.Thread(target=worker, daemon=True).start()
+        # The loop thread blocks, as a sync `crew.kickoff()` inside `async def main` would.
+        assert finished.wait(10)
+        assert isinstance(box["error"], LoopBindingError)
+        assert "appears blocked" in str(box["error"])
+        await asyncio.sleep(0.05)  # the cancelled call must not run once the loop is free
+        assert server.rpc_requests() == []
+
+
+async def test_aclose_from_another_live_loop_is_refused(server, loopback):
+    agent = RemoteAgent(server.base, policy=_policy())
+    await agent.card()
+    with pytest.raises(LoopBindingError):
+        await asyncio.to_thread(asyncio.run, agent.aclose())
+    await agent.aclose()
+
+
+def test_aclose_after_bound_loop_closed_drops_clients(server, loopback):
+    agent = RemoteAgent(server.base, policy=_policy())
+    asyncio.run(agent.card())
+    asyncio.run(agent.aclose())  # no error: connections died with their loop
+    assert agent._closed

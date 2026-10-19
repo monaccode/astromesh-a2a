@@ -21,10 +21,20 @@ the sync entry points of LangChain/LlamaIndex) go through ``run_sync()``:
   ``await agent.card()`` and a crew runs its tools in a worker thread): the call is
   dispatched to THAT loop;
 - the agent has no loop yet: the call runs on the adapters' background loop (one per
-  process), which becomes the agent's loop;
+  process), which becomes the agent's loop. A sync call thus binds the agent to that
+  loop: using it later from your own loop (``await agent.send(...)``, an async tool)
+  raises ``LoopBindingError``;
 - the agent's loop is closed or not running (e.g. ``asyncio.run(agent.card())`` earlier):
   ``LoopBindingError``, create one ``RemoteAgent`` per loop. From plain sync code, load the
-  card with ``run_sync(agent.card())`` instead.
+  card with ``run_sync(agent.card(), agent=agent)`` and close the agent with
+  ``run_sync(agent.aclose(), agent=agent)``.
+
+The dispatch waits at most ``agent.policy.timeout`` plus a few seconds. If the agent's
+loop is running but blocked (your ``async`` code called a sync framework entry point ON
+the loop thread, e.g. ``crew.kickoff()`` inside ``async def main``, and the framework runs
+tools in worker threads), the call could never run: it is cancelled and raises
+``LoopBindingError``. Use the framework's async entry point (``kickoff_async``,
+``ainvoke``...), or run the sync one with ``await asyncio.to_thread(...)``.
 
 A sync call from a thread whose own loop is running is refused (it would block it).
 """
@@ -32,6 +42,7 @@ A sync call from a thread whose own loop is running is refused (it would block i
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import json
 import keyword
@@ -74,6 +85,8 @@ PENDING_NOTE = (
     "approval or yes/no question on the user's behalf."
 )
 _NAME_MAX = 64
+_DISPATCH_GRACE = 5.0  # seconds past policy.timeout before a dispatch is deemed stuck
+BLOCKED_ERROR = "the agent's event loop appears blocked; use the async API or don't block the loop"
 _DESCRIPTION_MAX = 300
 _ERROR_MAX = 500
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
@@ -200,7 +213,8 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, agent: Any = None) -> _T:
     Without ``agent`` (or for an agent with no loop yet) it runs on the adapters'
     background loop. Raises ``RuntimeError`` when called from a thread whose event loop
     is running (it would block that loop); ``LoopBindingError`` when ``agent`` is bound
-    to a loop that is closed or not running.
+    to a loop that is closed or not running, or that stays blocked past
+    ``policy.timeout`` + 5 s (the call is then cancelled).
     """
     try:
         asyncio.get_running_loop()
@@ -218,7 +232,14 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, agent: Any = None) -> _T:
     elif loop.is_closed() or not loop.is_running():
         coro.close()
         raise LoopBindingError(LOOP_ERROR)
-    return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    policy = getattr(agent, "policy", None)
+    wait = policy.timeout + _DISPATCH_GRACE if policy is not None else None
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout=wait)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise LoopBindingError(BLOCKED_ERROR) from None
 
 
 # ---- the tool -----------------------------------------------------------------------
@@ -273,9 +294,9 @@ class RemoteTool:
         """Send (or reply with) ``query``; ``RemoteToolError`` on any ``A2AError``.
 
         Calls on one tool are serialized (a second call waits and sees the state the first
-        left). The pending task is dropped only when the remote reports it ended
-        (``TaskFailed.remote``); a local error (e.g. ``LoopBindingError``) propagates
-        and keeps it.
+        left). Any ``TaskFailed`` drops the pending task (the next call starts a new one);
+        it is kept on ``A2ATimeout``, ``PolicyRejected``/``BlockedDestination`` (nothing
+        was answered) and on local errors (e.g. ``LoopBindingError``), which propagate.
         """
         if not isinstance(query, str):
             raise TypeError("query must be a str")
@@ -288,8 +309,10 @@ class RemoteTool:
                 else:
                     result = await self.agent.send(query, context_id=self.context_id)
             except A2AError as exc:
-                if isinstance(exc, TaskFailed) and exc.remote:
-                    self.pending_task_id = None  # the remote ended it; next call starts anew
+                if isinstance(exc, TaskFailed):
+                    # The task is dead or unreachable (ended, canceled, unknown): drop it so
+                    # the next call starts a new task instead of replying to it forever.
+                    self.pending_task_id = None
                 raise RemoteToolError(error_message(exc), type(exc)) from None
             self.last_result = result
             self.context_id = result.context_id or self.context_id
