@@ -111,12 +111,27 @@ async def pin_to_public_ip(
 
 
 class _BoundedBody(httpx.AsyncByteStream):
-    """Response stream cut as soon as the decoded byte count passes the cap."""
+    """Response stream cut as soon as the decoded byte count passes the cap.
 
-    def __init__(self, stream: Any, max_bytes: int, transport: PinnedTransport):
+    With ``max_event_bytes`` (SSE bodies) each event, up to and including the blank line
+    that ends it, is capped too. Only LF ends a line here: a stream framed with bare CR
+    line endings reads as one long event and hits the event cap (fail closed).
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        max_bytes: int,
+        transport: PinnedTransport,
+        max_event_bytes: int | None = None,
+    ):
         self._stream = stream
         self._max = max_bytes
         self._transport = transport
+        self._event_max = max_event_bytes
+        self._event = 0  # bytes of the current SSE event
+        self._line = 0  # bytes of the current line, without its LF
+        self._cr = False  # the current line's last byte is CR
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         total = 0
@@ -124,7 +139,29 @@ class _BoundedBody(httpx.AsyncByteStream):
             total += len(chunk)
             if total > self._max:
                 raise self._transport._fail(f"Blocked: response exceeds {self._max} bytes")
+            if self._event_max is not None:
+                self._scan(chunk)
             yield chunk
+
+    def _scan(self, chunk: bytes) -> None:
+        start = 0
+        while True:
+            nl = chunk.find(b"\n", start)
+            end = len(chunk) if nl < 0 else nl
+            if end > start:
+                self._line += end - start
+                self._cr = chunk[end - 1] == 13
+            self._event += end - start + (nl >= 0)
+            if self._event > self._event_max:
+                raise self._transport._fail(
+                    f"Blocked: stream event exceeds {self._event_max} bytes"
+                )
+            if nl < 0:
+                return
+            if self._line == 0 or (self._line == 1 and self._cr):  # blank line: event ends
+                self._event = 0
+            self._line, self._cr = 0, False
+            start = nl + 1
 
     async def aclose(self) -> None:
         await self._stream.aclose()
@@ -144,12 +181,14 @@ class PinnedTransport(httpx.AsyncBaseTransport):
     def __init__(
         self,
         max_bytes: int = 1_048_576,
+        max_stream_bytes: int | None = None,
         inner: httpx.AsyncBaseTransport | None = None,
         resolver: Resolver | None = None,
         allow_private: bool = False,
     ):
         self._inner = inner or httpx.AsyncHTTPTransport()
         self.max_bytes = max_bytes
+        self.max_stream_bytes = max_bytes if max_stream_bytes is None else max_stream_bytes
         self._resolver = resolver
         self._allow_private = allow_private
         self._pins: dict[tuple, tuple[str, str, str] | None] = {}
@@ -209,10 +248,19 @@ class PinnedTransport(httpx.AsyncBaseTransport):
             raise self._fail(f"Blocked: response has content-encoding {encoding}")
         if 300 <= response.status_code < 400:
             self._note(f"server answered {response.status_code} (redirects are not followed)")
+        sse = "text/event-stream" in original.headers.get(
+            "accept", ""
+        ).lower() and response.headers.get("content-type", "").strip().lower().startswith(
+            "text/event-stream"
+        )
+        if sse:
+            body = _BoundedBody(response.stream, self.max_stream_bytes, self, self.max_bytes)
+        else:
+            body = _BoundedBody(response.stream, self.max_bytes, self)
         return httpx.Response(
             response.status_code,
             headers=response.headers,
-            stream=_BoundedBody(response.stream, self.max_bytes, self),
+            stream=body,
             extensions=response.extensions,
             request=original,
         )
@@ -222,7 +270,12 @@ class PinnedTransport(httpx.AsyncBaseTransport):
 
 
 def safe_client(
-    *, timeout: float, max_bytes: int, allow_private: bool = False, **kwargs: Any
+    *,
+    timeout: float,
+    max_bytes: int,
+    max_stream_bytes: int | None = None,
+    allow_private: bool = False,
+    **kwargs: Any,
 ) -> httpx.AsyncClient:
     """An ``httpx.AsyncClient`` whose every request passes the egress guard.
 
@@ -234,7 +287,9 @@ def safe_client(
     if "mounts" in kwargs or "proxy" in kwargs or "transport" in kwargs:
         raise ValueError("safe_client does not accept 'mounts', 'proxy' or 'transport'")
     return httpx.AsyncClient(
-        transport=PinnedTransport(max_bytes=max_bytes, allow_private=allow_private),
+        transport=PinnedTransport(
+            max_bytes=max_bytes, max_stream_bytes=max_stream_bytes, allow_private=allow_private
+        ),
         timeout=timeout,
         follow_redirects=False,
         **kwargs,

@@ -1,4 +1,4 @@
-from astromesh_a2a.client import RemoteAgent
+from astromesh_a2a.client import EventStream, RemoteAgent
 from astromesh_a2a.errors import (
     A2AError,
     A2ATimeout,
@@ -10,7 +10,7 @@ from astromesh_a2a.errors import (
 )
 from astromesh_a2a.policy import Budget, BudgetMeter, Policy
 from astromesh_a2a.trace import Trace
-from astromesh_a2a.types import Auth, Origin, Result
+from astromesh_a2a.types import Auth, Event, Origin, Result
 
 __version__ = "0.1.0"
 
@@ -22,6 +22,8 @@ __all__ = [
     "Budget",
     "BudgetMeter",
     "ConfirmationRequired",
+    "Event",
+    "EventStream",
     "Origin",
     "Policy",
     "PolicyRejected",

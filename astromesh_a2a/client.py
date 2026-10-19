@@ -9,7 +9,18 @@ Flow of a call (ADR 0001 §1, §5):
    interface URL (same host as the card, or itself allowed by the policy).
 3. An SDK ``Client`` is built over OUR httpx client from a copy of the card that keeps
    only the vetted interface, so the SDK cannot pick another one.
-4. Every SDK call runs under ``policy.timeout`` wall-clock, on top of httpx timeouts.
+4. Every SDK call runs under ``policy.timeout`` wall-clock (or what is left of the seconds
+   budget, if less), on top of httpx timeouts. A stream is also capped at
+   ``policy.max_events`` events; either cap raises ``A2ATimeout``.
+5. Budgets: one ``BudgetMeter`` per ``RemoteAgent``. Each ``send``/``reply``/``stream``/
+   ``cancel`` is admitted BEFORE any request (card included) leaves; an exhausted budget
+   raises ``PolicyRejected("budget")`` and nothing is sent. The time each call took is
+   recorded afterwards.
+6. The vetted card is cached ``policy.card_ttl`` seconds; then it is fetched and vetted
+   again (all checks), and the SDK clients are rebuilt over the new card.
+
+Confirmations are never answered here: ``send()`` returns ``input_required`` and
+``stream()`` emits that status and ends. Only an explicit ``reply()`` continues the task.
 
 HTTP clients: ``net.safe_client`` pins ONE host per client. The card client is reused for
 the RPC when the interface is on the same scheme/host/port; otherwise a second safe client
@@ -28,9 +39,11 @@ import base64
 import contextlib
 import json
 import sys
+import time
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -39,12 +52,14 @@ from a2a.client.card_resolver import parse_agent_card
 from a2a.types import (
     AgentCard,
     AgentInterface,
+    CancelTaskRequest,
     Message,
     Part,
     Role,
     SendMessageRequest,
     StreamResponse,
     TaskState,
+    TaskStatus,
 )
 from a2a.utils import errors as sdk_errors
 from a2a.utils.constants import TransportProtocol
@@ -58,14 +73,26 @@ from astromesh_a2a.errors import (
     TaskFailed,
     UnsupportedVersion,
 )
-from astromesh_a2a.policy import Policy
+from astromesh_a2a.policy import BudgetMeter, Policy
 from astromesh_a2a.trace import Trace
-from astromesh_a2a.types import Auth, Origin, Result
+from astromesh_a2a.types import Auth, Event, Origin, Result
 
 WELL_KNOWN_CARD = "/.well-known/agent-card.json"
 A2A_VERSION = "1.0"
 _MAX_REMOTE_TEXT = 200
 _MAX_VERSIONS_SHOWN = 5
+_MAX_CONTEXTS = 256  # task_id -> context_id remembered for reply()
+_FINAL_STATES = frozenset(
+    {
+        TaskState.TASK_STATE_COMPLETED,
+        TaskState.TASK_STATE_FAILED,
+        TaskState.TASK_STATE_CANCELED,
+        TaskState.TASK_STATE_REJECTED,
+        TaskState.TASK_STATE_INPUT_REQUIRED,
+        TaskState.TASK_STATE_AUTH_REQUIRED,
+    }
+)
+_T = TypeVar("_T")
 
 if sys.version_info >= (3, 11):
     _deadline = asyncio.timeout
@@ -138,6 +165,42 @@ def _parts_text(parts: Any) -> str:
     return "\n".join(p.text for p in parts if p.WhichOneof("content") == "text")
 
 
+def _state_name(state: int) -> str:
+    return TaskState.Name(state).removeprefix("TASK_STATE_").lower()
+
+
+class EventStream:
+    """What ``RemoteAgent.stream()`` returns: an async iterator of ``Event``.
+
+    Nothing is sent until the first ``__anext__``. ``trace`` holds the redacted trace so
+    far. To stop early, use ``async with agent.stream(...) as events:`` or ``aclose()``:
+    that closes the remote stream.
+    """
+
+    def __init__(self, events: Any, trace: Trace):
+        self._events = events
+        self._trace = trace
+
+    @property
+    def trace(self) -> list[dict[str, Any]]:
+        return self._trace.to_dict()
+
+    def __aiter__(self) -> EventStream:
+        return self
+
+    async def __anext__(self) -> Event:
+        return await self._events.__anext__()
+
+    async def aclose(self) -> None:
+        await self._events.aclose()
+
+    async def __aenter__(self) -> EventStream:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+
 class RemoteAgent:
     """A remote A2A agent, reached only as far as ``policy`` allows.
 
@@ -166,10 +229,14 @@ class RemoteAgent:
         self._fetch_url = _card_fetch_url(card_url)
         self._lock = asyncio.Lock()
         self._card: AgentCard | None = None
+        self._card_at = 0.0
         self._interface: AgentInterface | None = None
         self._card_http: httpx.AsyncClient | None = None
         self._rpc_http: httpx.AsyncClient | None = None
+        self._retired: list[httpx.AsyncClient] = []  # replaced by a card refresh
         self._clients: dict[bool, Any] = {}
+        self._contexts: OrderedDict[str, str] = OrderedDict()
+        self._meter = BudgetMeter(policy.budget)
         self._closed = False
 
     def __repr__(self) -> str:
@@ -185,9 +252,11 @@ class RemoteAgent:
         """Close the HTTP clients this agent owns. Idempotent."""
         self._closed = True
         self._clients = {}  # SDK clients are dropped, never closed (would close our httpx)
-        for hx in {id(c): c for c in (self._card_http, self._rpc_http) if c}.values():
+        owned = (self._card_http, self._rpc_http, *self._retired)
+        for hx in {id(c): c for c in owned if c}.values():
             await hx.aclose()
         self._card_http = self._rpc_http = None
+        self._retired = []
 
     def _check_open(self) -> None:
         if self._closed:
@@ -196,7 +265,7 @@ class RemoteAgent:
     # ---- card -------------------------------------------------------------------
 
     async def card(self) -> AgentCard:
-        """The vetted agent card (fetched once, then cached). Returns a copy."""
+        """The vetted agent card (cached ``policy.card_ttl`` seconds). Returns a copy."""
         self._check_open()
         try:
             async with _deadline(self.policy.timeout):
@@ -209,11 +278,23 @@ class RemoteAgent:
 
     async def _vetted_card(self, trace: Trace) -> AgentCard:
         async with self._lock:
-            if self._card is None:
-                self._card = await self._load_card(trace)
-            else:
+            now = time.monotonic()
+            if self._card is not None and now - self._card_at < self.policy.card_ttl:
                 trace.add("card", url=self._fetch_url, cached=True)
-            return self._card
+                return self._card
+            previous = self._interface
+            self._card = None  # a refresh that fails the checks leaves no stale card behind
+            card = await self._load_card(trace)
+            if previous is not None:  # refreshed: rebuild the SDK clients over the new card
+                self._clients = {}
+                assert self._interface is not None
+                moved = _origin_key(previous.url) != _origin_key(self._interface.url)
+                if moved and self._rpc_http is not None:
+                    if self._rpc_http is not self._card_http:
+                        self._retired.append(self._rpc_http)  # may still serve a stream
+                    self._rpc_http = None
+            self._card, self._card_at = card, now
+            return card
 
     async def _load_card(self, trace: Trace) -> AgentCard:
         if self._card_http is None:
@@ -290,35 +371,112 @@ class RemoteAgent:
     async def send(
         self, text: str, *, context_id: str | None = None, data: dict | None = None
     ) -> Result:
-        """Send one message and wait for the task to finish or ask for input."""
+        """Send one message and wait for the task to finish or ask for input.
+
+        A remote that asks for input (even "reply yes to confirm") gets no answer from
+        here: the ``Result`` comes back ``input_required`` with the question in
+        ``pending``; only an explicit ``reply()`` continues the task.
+        """
         self._check_open()
         data = _json_data(data)
         trace = Trace()
-        try:
-            async with _deadline(self.policy.timeout):
-                await self._vetted_card(trace)
-                final = await self._send_blocking(text, context_id, data, trace)
-        except TimeoutError:
-            raise A2ATimeout(f"remote call exceeded {self.policy.timeout}s") from None
-        except A2AError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - translated below, never passed through
-            failure = exc
-        else:
-            return self._to_result(final, trace)
-        raise _translated(failure)  # outside the handler: no implicit __context__ cycle
+        final = await self._guarded(
+            lambda: self._send_blocking(text, context_id, data, trace), trace
+        )
+        return self._to_result(final, trace)
 
-    async def _send_blocking(
-        self, text: str, context_id: str | None, data: dict | None, trace: Trace
-    ) -> StreamResponse:
+    async def reply(self, task_id: str, text: str) -> Result:
+        """Answer a task that asked for input: a new message on the SAME task.
+
+        This is the only way a pending task continues; the caller (a model or a human
+        on this side) decides the answer.
+        """
+        self._check_open()
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be a non-empty str")
+        trace = Trace()
+        context_id = self._contexts.get(task_id)
+        final = await self._guarded(
+            lambda: self._send_blocking(text, context_id, None, trace, task_id=task_id),
+            trace,
+        )
+        return self._to_result(final, trace)
+
+    async def cancel(self, task_id: str) -> None:
+        """Ask the remote to cancel a task. ``TaskFailed`` if it already ended otherwise."""
+        self._check_open()
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task_id must be a non-empty str")
+        trace = Trace()
+        task = await self._guarded(lambda: self._cancel(task_id, trace), trace)
+        state = task.status.state
+        if state in _FINAL_STATES and state != TaskState.TASK_STATE_CANCELED:
+            raise TaskFailed(f"remote task could not be canceled (state {_state_name(state)})")
+
+    def stream(self, text: str, *, context_id: str | None = None) -> EventStream:
+        """Send one message over SSE and yield its events as they arrive.
+
+        Ends after the first final status (completed, failed, canceled, rejected,
+        input_required, auth_required) or a message. A failed/canceled task is an event,
+        not an error. Capped by ``policy.timeout`` (whole stream, wall-clock) and
+        ``policy.max_events``: past either, ``A2ATimeout`` and the stream is closed.
+        Use as ``async for event in agent.stream(...)``.
+        """
+        self._check_open()
+        trace = Trace()
+        return EventStream(self._stream(text, context_id, trace), trace)
+
+    # ---- plumbing -----------------------------------------------------------------
+
+    def _limit(self) -> float:
+        """Wall-clock cap for one call: the policy timeout, or the budget left if less."""
+        left = self._meter.remaining_seconds()
+        return self.policy.timeout if left is None else min(self.policy.timeout, left)
+
+    async def _guarded(self, run: Callable[[], Awaitable[_T]], trace: Trace) -> _T:
+        """Budget, deadline, vetted card, then ``run()``; failures become our errors."""
+        self._meter.admit()
+        limit = self._limit()
+        started = time.monotonic()
+        cut = False  # a call cut by its deadline spent the whole limit
+        try:
+            try:
+                async with _deadline(limit):
+                    await self._vetted_card(trace)
+                    return await run()
+            except TimeoutError:
+                cut = True
+                raise A2ATimeout(f"remote call exceeded {limit:g}s") from None
+            except A2AError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - translated below, never passed through
+                failure = exc
+            raise _translated(failure)  # outside the handler: no implicit __context__ cycle
+        finally:
+            elapsed = time.monotonic() - started
+            self._meter.record_seconds(max(elapsed, limit) if cut else elapsed)
+
+    def _call_context(self, trace: Trace) -> tuple[ClientCallContext, str]:
         traceparent = trace.traceparent()
         headers = {"traceparent": traceparent}
         if self.auth is not None:
             headers.update(self.auth.headers())
+        context = ClientCallContext(service_parameters=headers, timeout=self.policy.timeout)
+        return context, traceparent
+
+    def _message_request(
+        self,
+        text: str,
+        context_id: str | None,
+        data: dict | None,
+        task_id: str | None,
+        traceparent: str,
+    ) -> SendMessageRequest:
         message = Message(
             role=Role.ROLE_USER,
             message_id=uuid.uuid4().hex,
             context_id=context_id or "",
+            task_id=task_id or "",
             parts=[Part(text=text)],
         )
         if data is not None:
@@ -326,9 +484,27 @@ class RemoteAgent:
             part.data.struct_value.update(data)
             message.parts.append(part)
         message.metadata.update({"origin": self.origin.value, "traceparent": traceparent})
-        request = SendMessageRequest(message=message)
-        context = ClientCallContext(service_parameters=headers, timeout=self.policy.timeout)
-        trace.add("send", method="SendMessage", origin=self.origin.value, context_id=context_id)
+        return SendMessageRequest(message=message)
+
+    async def _send_blocking(
+        self,
+        text: str,
+        context_id: str | None,
+        data: dict | None,
+        trace: Trace,
+        *,
+        task_id: str | None = None,
+    ) -> StreamResponse:
+        context, traceparent = self._call_context(trace)
+        request = self._message_request(text, context_id, data, task_id, traceparent)
+        fields: dict[str, Any] = {"task_id": task_id} if task_id else {}
+        trace.add(
+            "send",
+            method="SendMessage",
+            origin=self.origin.value,
+            context_id=context_id,
+            **fields,
+        )
         client = self._sdk_client(streaming=False)
         final = None
         async for event in client.send_message(request, context=context):
@@ -336,6 +512,148 @@ class RemoteAgent:
         if final is None:
             raise TaskFailed("remote returned no response")
         return final
+
+    async def _cancel(self, task_id: str, trace: Trace) -> Any:
+        context, _ = self._call_context(trace)
+        trace.add("send", method="CancelTask", task_id=task_id)
+        client = self._sdk_client(streaming=False)
+        return await client.cancel_task(CancelTaskRequest(id=task_id), context=context)
+
+    async def _stream(
+        self, text: str, context_id: str | None, trace: Trace
+    ) -> AsyncIterator[Event]:
+        self._meter.admit()
+        limit = self._limit()
+        started = time.monotonic()
+        cut = False  # a call cut by its deadline spent the whole limit
+        deadline = started + limit
+        events: Any = None
+        count = 0
+        try:
+            try:
+                async with _deadline(limit):
+                    await self._vetted_card(trace)
+                context, traceparent = self._call_context(trace)
+                request = self._message_request(text, context_id, None, None, traceparent)
+                trace.add(
+                    "send",
+                    method="SendStreamingMessage",
+                    origin=self.origin.value,
+                    context_id=context_id,
+                )
+                events = self._sdk_client(streaming=True).send_message(request, context=context)
+                while True:
+                    # The deadline covers the waits on the remote, never the caller's code
+                    # (a yield inside a timeout block would cancel the caller instead).
+                    async with _deadline(max(0.0, deadline - time.monotonic())):
+                        try:
+                            raw = await events.__anext__()
+                        except StopAsyncIteration:
+                            break
+                    count += 1
+                    if count > self.policy.max_events:
+                        raise A2ATimeout(f"stream exceeded {self.policy.max_events} events")
+                    stop = False
+                    for event in self._to_events(raw, trace):
+                        stop = stop or event.kind == "message" or event.payload.get("final")
+                        yield event
+                    if stop:
+                        break
+            except TimeoutError:
+                cut = True
+                raise A2ATimeout(f"stream exceeded {limit:g}s") from None
+            except A2AError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - translated below, never passed through
+                failure = exc
+            else:
+                return
+            raise _translated(failure)
+        finally:
+            if events is not None:
+                with contextlib.suppress(Exception):
+                    await events.aclose()
+            elapsed = time.monotonic() - started
+            self._meter.record_seconds(max(elapsed, limit) if cut else elapsed)
+
+    # ---- events -----------------------------------------------------------------
+
+    def _to_events(self, raw: StreamResponse, trace: Trace) -> list[Event]:
+        kind = raw.WhichOneof("payload")
+        if kind == "task":
+            task = raw.task
+            out = [
+                self._artifact_event(a, task.id, task.context_id, False, True, trace)
+                for a in task.artifacts
+            ]
+            out.append(self._status_event(task.status, task.id, task.context_id, trace))
+            return out
+        if kind == "status_update":
+            u = raw.status_update
+            return [self._status_event(u.status, u.task_id, u.context_id, trace)]
+        if kind == "artifact_update":
+            a = raw.artifact_update
+            return [
+                self._artifact_event(
+                    a.artifact, a.task_id, a.context_id, a.append, a.last_chunk, trace
+                )
+            ]
+        if kind == "message":
+            m = raw.message
+            trace.add("message", task_id=m.task_id or None, parts=len(m.parts))
+            text, data = self._accept(m.parts, trace)
+            return [Event("message", self._payload(m.task_id, m.context_id, text, data))]
+        raise TaskFailed(f"unexpected stream event {kind!r}")
+
+    def _payload(
+        self, task_id: str, context_id: str, text: str, data: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        self._remember(task_id, context_id)
+        return {
+            "task_id": task_id or None,
+            "context_id": context_id or None,
+            "text": text,
+            "data": data,
+            "untrusted": True,
+        }
+
+    def _status_event(
+        self, status: TaskStatus, task_id: str, context_id: str, trace: Trace
+    ) -> Event:
+        state = _state_name(status.state)
+        trace.add("status", state=state, task_id=task_id or None)
+        text, data = self._accept(status.message.parts, trace)
+        payload = self._payload(task_id, context_id, text, data)
+        payload.update(state=state, final=status.state in _FINAL_STATES)
+        return Event("status", payload)
+
+    def _artifact_event(
+        self,
+        artifact: Any,
+        task_id: str,
+        context_id: str,
+        append: bool,
+        last_chunk: bool,
+        trace: Trace,
+    ) -> Event:
+        artifact_id = artifact.artifact_id or None
+        trace.add("artifact", artifact_id=artifact_id, parts=len(artifact.parts))
+        text, data = self._accept(artifact.parts, trace)
+        payload = self._payload(task_id, context_id, text, data)
+        payload.update(
+            artifact_id=artifact_id,
+            name=artifact.name or None,
+            append=bool(append),
+            last_chunk=bool(last_chunk),
+        )
+        return Event("artifact", payload)
+
+    def _remember(self, task_id: str, context_id: str) -> None:
+        if task_id and context_id:
+            self._contexts[task_id] = context_id
+            self._contexts.move_to_end(task_id)
+            while len(self._contexts) > _MAX_CONTEXTS:
+                self._contexts.popitem(last=False)
 
     # ---- result -----------------------------------------------------------------
 
@@ -376,6 +694,7 @@ class RemoteAgent:
         pending: str | None,
     ) -> Result:
         trace.add("result", status=status, task_id=task_id or None, parts=len(data))
+        self._remember(task_id, context_id)
         return Result(
             status=status,
             answer=answer,

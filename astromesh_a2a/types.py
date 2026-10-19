@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from astromesh_a2a.errors import PolicyRejected
 
@@ -35,6 +35,22 @@ class Result:
     context_id: str | None
     pending: str | None
     trace: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Event:
+    """One event of ``RemoteAgent.stream()``, already normalized (no protobuf).
+
+    ``kind`` is ``"status"``, ``"artifact"`` or ``"message"``. Every ``payload`` has
+    ``task_id``, ``context_id``, ``text`` (accepted text parts, joined), ``data`` (accepted
+    data/file parts) and ``untrusted=True``: it was written by the remote. A ``status``
+    payload adds ``state`` (``"working"``, ``"completed"``, ``"input_required"``...) and
+    ``final``; an ``artifact`` payload adds ``artifact_id``, ``name``, ``append`` and
+    ``last_chunk``.
+    """
+
+    kind: Literal["status", "artifact", "message"]
+    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)

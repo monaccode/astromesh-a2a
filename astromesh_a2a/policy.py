@@ -35,6 +35,11 @@ class Policy:
     a map ``kid -> key`` (PEM/secret str or bytes, or a ``jwt.PyJWK``), with only the
     ``signing_algorithms`` listed. Keys are pinned by ``kid``: a ``jku`` URL in the
     (untrusted) card header is never fetched. Needs the ``signing`` extra (PyJWT).
+
+    ``max_bytes`` caps every response body and every part. A stream (SSE) is capped at
+    ``max_stream_bytes`` in total and ``max_bytes`` per event, and also by ``timeout``
+    (wall-clock for the whole stream) and ``max_events``. The vetted card is cached for
+    ``card_ttl`` seconds, then fetched and vetted again.
     """
 
     allowed: tuple[str, ...] = ()
@@ -44,6 +49,8 @@ class Policy:
     timeout: float = 60.0
     max_events: int = 1000
     budget: Budget | None = None
+    max_stream_bytes: int = 8_388_608
+    card_ttl: float = 300.0
     allow_insecure_http: bool = False
     signing_keys: Mapping[str, Any] = field(default_factory=dict, hash=False, repr=False)
     signing_algorithms: tuple[str, ...] = ("ES256", "ES384", "RS256", "PS256", "EdDSA")
@@ -59,6 +66,8 @@ class Policy:
             raise TypeError("Policy.signing_algorithms must be a sequence, not a bare str")
         object.__setattr__(self, "signing_algorithms", tuple(self.signing_algorithms))
         object.__setattr__(self, "signing_keys", MappingProxyType(dict(self.signing_keys)))
+        if self.card_ttl < 0:
+            raise ValueError("Policy.card_ttl must be >= 0")
 
     def check_card_url(self, url: str) -> None:
         """Raise PolicyRejected unless ``url`` is https (or opted-in http) and allowed."""
@@ -93,7 +102,12 @@ class Policy:
 
     def client(self, **kwargs: Any) -> httpx.AsyncClient:
         """An egress-guarded client with this policy's timeout and size cap."""
-        return net.safe_client(timeout=self.timeout, max_bytes=self.max_bytes, **kwargs)
+        return net.safe_client(
+            timeout=self.timeout,
+            max_bytes=self.max_bytes,
+            max_stream_bytes=self.max_stream_bytes,
+            **kwargs,
+        )
 
 
 class BudgetMeter:
@@ -109,6 +123,30 @@ class BudgetMeter:
         b = self.budget
         if b and b.max_calls is not None and self.calls > b.max_calls:
             raise PolicyRejected("budget")
+
+    def admit(self) -> None:
+        """Charge one call BEFORE it starts; ``PolicyRejected("budget")`` if none is left.
+
+        Refused when the calls are used up or the seconds already spent reach the cap. A
+        refused call is not counted.
+        """
+        b = self.budget
+        if b and b.max_seconds is not None and self.seconds >= b.max_seconds:
+            raise PolicyRejected("budget")
+        if b and b.max_calls is not None and self.calls >= b.max_calls:
+            raise PolicyRejected("budget")
+        self.calls += 1
+
+    def remaining_seconds(self) -> float | None:
+        """Seconds left in the budget (``None`` if seconds are not capped)."""
+        b = self.budget
+        if b is None or b.max_seconds is None:
+            return None
+        return max(0.0, b.max_seconds - self.seconds)
+
+    def record_seconds(self, s: float) -> None:
+        """Add the time a call took; never raises (the call already happened)."""
+        self.seconds += max(0.0, s)
 
     def charge_seconds(self, s: float) -> None:
         if s < 0:

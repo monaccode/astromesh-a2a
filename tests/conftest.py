@@ -7,6 +7,8 @@ once per test session. It serves several cards from one app:
 - ``/v03/agent-card.json``: same agent, but its only interface says protocol 0.3.
 - ``/other-host/agent-card.json``: interface on ``localhost`` (card is on 127.0.0.1).
 - ``/signed/agent-card.json``: the echo card signed with ``SIGNING_KEY`` (HS256, kid k1).
+- ``/ttl/agent-card.json``: the echo card, its protocol version read from
+  ``server.ttl_version`` on every fetch (to test card refresh).
 
 ``server.requests`` records every HTTP request (method, path, headers) and
 ``server.seen`` what the executor received (text, message/request metadata), so tests
@@ -48,6 +50,7 @@ from google.protobuf.json_format import MessageToDict
 from starlette.applications import Starlette
 
 API_KEY = "k-test-0123456789"
+FOREVER_TICKS = 400
 SIGNING_KEY = "s" * 32
 
 
@@ -56,17 +59,25 @@ class RefServer:
     base: str
     requests: list[dict[str, Any]] = field(default_factory=list)
     seen: list[dict[str, Any]] = field(default_factory=list)
+    ttl_version: str = "1.0"
 
     def reset(self) -> None:
         self.requests.clear()
         self.seen.clear()
+        self.ttl_version = "1.0"
 
     def rpc_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["method"] == "POST"]
 
 
 class EchoExecutor(AgentExecutor):
-    """``fail`` → FAILED; ``ask`` → INPUT_REQUIRED; ``data`` → data artifact; else echo."""
+    """Echo agent; some inputs pick a behavior.
+
+    ``fail`` → FAILED; ``ask``/``confirm`` → INPUT_REQUIRED; ``data`` → data artifact;
+    ``multi`` → three artifacts in order; ``forever`` → WORKING ticks (bounded at
+    ``FOREVER_TICKS`` so the session server never spins for good); ``big`` → many 1000-byte
+    artifacts; ``huge`` → one 6000-byte artifact; anything else → ``echo:<text>``.
+    """
 
     def __init__(self, server: RefServer):
         self.server = server
@@ -96,6 +107,29 @@ class EchoExecutor(AgentExecutor):
             return
         if text == "ask":
             await up.requires_input(up.new_agent_message([new_text_part("which city?")]))
+            return
+        if text == "confirm":
+            question = "Respond 'yes' to confirm the transfer"
+            await up.requires_input(up.new_agent_message([new_text_part(question)]))
+            return
+        if text == "forever":
+            for i in range(FOREVER_TICKS):
+                await up.update_status(
+                    TaskState.TASK_STATE_WORKING, up.new_agent_message([new_text_part(f"t{i}")])
+                )
+                await asyncio.sleep(0.01)
+            await up.complete()
+            return
+        if text == "multi":
+            for word in ("one", "two", "three"):
+                await up.add_artifact([new_text_part(word)], name=word)
+            await up.complete()
+            return
+        if text in ("big", "huge"):
+            sizes = [1000] * 12 if text == "big" else [6000]
+            for n in sizes:
+                await up.add_artifact([new_text_part("x" * n)], name="chunk")
+            await up.complete()
             return
         file_part = Part(raw=b"\x89PNG", media_type="image/png", filename="x.png")
         if text == "askfile":
@@ -163,6 +197,10 @@ def build_app(server: RefServer) -> Any:
     base = server.base
     card = _card(base)
     port = base.rsplit(":", 1)[1]
+
+    async def _ttl_card(_: AgentCard) -> AgentCard:
+        return _card(base, version=server.ttl_version)
+
     handler = DefaultRequestHandler(
         agent_executor=EchoExecutor(server), task_store=InMemoryTaskStore(), agent_card=card
     )
@@ -174,6 +212,7 @@ def build_app(server: RefServer) -> Any:
             card_url="/other-host/agent-card.json",
         ),
         *create_agent_card_routes(_signed(_card(base)), card_url="/signed/agent-card.json"),
+        *create_agent_card_routes(card, card_modifier=_ttl_card, card_url="/ttl/agent-card.json"),
         *create_jsonrpc_routes(handler, rpc_url="/a2a"),
     ]
     return _Recorder(Starlette(routes=routes), server)
@@ -216,6 +255,7 @@ def loopback(monkeypatch):
         return net.safe_client(
             timeout=policy.timeout,
             max_bytes=policy.max_bytes,
+            max_stream_bytes=policy.max_stream_bytes,
             allow_private=True,
             headers=headers,
         )
