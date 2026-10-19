@@ -64,8 +64,6 @@ from a2a.types import (
 )
 from a2a.utils import errors as sdk_errors
 from a2a.utils.constants import TransportProtocol
-from google.protobuf import json_format as pb_json
-from google.protobuf import message as pb_message
 from google.protobuf.json_format import MessageToDict
 
 from astromesh_a2a.card import RemoteCard
@@ -103,19 +101,18 @@ class _ClosedError(RuntimeError):
     """The RemoteAgent was closed (passes through unchanged, never translated)."""
 
 
+class LoopBindingError(RuntimeError):
+    """A ``RemoteAgent`` was used from an event loop other than the one it is bound to
+    (the loop of its first I/O). Local; never translated. Create one agent per loop."""
+
+
 LOOP_ERROR = "RemoteAgent is bound to another event loop; create one RemoteAgent per loop"
 
-# Failures that come from the network or the remote's bytes: translated to our errors.
-# Anything else (RuntimeError, TypeError, a bug...) is local and propagates unchanged.
-_REMOTE_FAILURES = (
-    sdk_errors.A2AError,
-    httpx.HTTPError,
-    OSError,
-    pb_json.Error,
-    pb_message.Error,
-    json.JSONDecodeError,
-    UnicodeDecodeError,
-)
+# Local sentinels: they pass through untranslated. Anything else raised during an RPC
+# (an SDK bug on a malformed response included) becomes a generic TaskFailed, whose
+# message never quotes the remote. CancelledError/KeyboardInterrupt are BaseExceptions
+# and are never caught.
+_LOCAL_SENTINELS = (A2AError, _ClosedError, LoopBindingError)
 
 
 @dataclass
@@ -304,7 +301,7 @@ class RemoteAgent:
         if self._loop is None:
             self._loop = loop
         elif self._loop is not loop:
-            raise RuntimeError(LOOP_ERROR)
+            raise LoopBindingError(LOOP_ERROR)
 
     # ---- card -------------------------------------------------------------------
 
@@ -467,7 +464,10 @@ class RemoteAgent:
         task = await self._guarded(lambda: self._cancel(task_id, trace), trace)
         state = task.status.state
         if state in _FINAL_STATES and state != TaskState.TASK_STATE_CANCELED:
-            raise TaskFailed(f"remote task could not be canceled (state {_state_name(state)})")
+            raise TaskFailed(
+                f"remote task could not be canceled (state {_state_name(state)})",
+                remote=True,
+            )
 
     def stream(self, text: str, *, context_id: str | None = None) -> EventStream:
         """Send one message over SSE and yield its events as they arrive.
@@ -518,8 +518,8 @@ class RemoteAgent:
         return self.policy.timeout if left is None else min(self.policy.timeout, left)
 
     async def _guarded(self, run: Callable[[], Awaitable[_T]], trace: Trace) -> _T:
-        """Budget, deadline, vetted card, then ``run()``; remote failures become our errors
-        (local ones, e.g. a ``RuntimeError``, propagate unchanged)."""
+        """Budget, deadline, vetted card, then ``run()``; failures become our errors (only
+        our local sentinels pass through)."""
         self._bind_loop()
         self._meter.admit()
         limit = self._limit()
@@ -533,11 +533,9 @@ class RemoteAgent:
             except TimeoutError:
                 cut = True
                 raise A2ATimeout(f"remote call exceeded {limit:g}s") from None
-            except (A2AError, _ClosedError):
+            except _LOCAL_SENTINELS:
                 raise
-            except Exception as exc:
-                if not _is_remote_failure(exc):
-                    raise
+            except Exception as exc:  # noqa: BLE001 - translated below, never passed through
                 failure = exc
             raise _translated(failure)  # outside the handler: no implicit __context__ cycle
         finally:
@@ -652,11 +650,9 @@ class RemoteAgent:
             except TimeoutError:
                 cut = True
                 raise A2ATimeout(f"stream exceeded {limit:g}s") from None
-            except (A2AError, _ClosedError):
+            except _LOCAL_SENTINELS:
                 raise
-            except Exception as exc:
-                if not _is_remote_failure(exc):
-                    raise
+            except Exception as exc:  # noqa: BLE001 - translated below, never passed through
                 failure = exc
             else:
                 return
@@ -808,7 +804,7 @@ class RemoteAgent:
         if state in (TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING):
             raise A2ATimeout(f"remote task did not finish (state {name})")
         detail = f": {_remote_text(status_text)}" if status_text else ""
-        raise TaskFailed(f"remote task {name}{detail}")
+        raise TaskFailed(f"remote task {name}{detail}", remote=True)
 
     def _finish(
         self,
@@ -940,10 +936,6 @@ def _chain(exc: BaseException) -> Iterator[BaseException]:
         seen.add(id(current))
         yield current
         current = current.__cause__ or current.__context__
-
-
-def _is_remote_failure(exc: BaseException) -> bool:
-    return any(isinstance(e, _REMOTE_FAILURES) for e in _chain(exc))
 
 
 def _translated(exc: BaseException) -> A2AError:

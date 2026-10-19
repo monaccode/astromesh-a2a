@@ -21,6 +21,7 @@ from astromesh_a2a.adapters._common import (
     tool_name,
     wrap_untrusted,
 )
+from astromesh_a2a.client import LOOP_ERROR, LoopBindingError
 
 
 def test_adapter_envuelve_no_confiable():
@@ -65,7 +66,7 @@ async def test_tool_replies_to_pending_task_then_starts_over():
 
 
 async def test_failed_task_clears_pending():
-    agent = FakeAgent(asking(), TaskFailed("remote task FAILED: <boom>"), done())
+    agent = FakeAgent(asking(), TaskFailed("remote task FAILED: <boom>", remote=True), done())
     tool = RemoteTool.for_agent(agent, None, None)
     await tool.acall("a")
     with pytest.raises(Exception, match=r"TaskFailed\): remote task FAILED: &lt;boom&gt;"):
@@ -164,11 +165,11 @@ async def test_concurrent_calls_on_one_tool_are_serialized():
 
 
 async def test_local_error_keeps_pending_and_propagates():
-    agent = FakeAgent(asking(task_id="t-1"), RuntimeError("bug here"), done("ok"))
+    agent = FakeAgent(asking(task_id="t-1"), LoopBindingError(LOOP_ERROR), done("ok"))
     tool = RemoteTool.for_agent(agent, None, None)
     await tool.acall("pay")
     assert tool.last_result.status == "input_required"
-    with pytest.raises(RuntimeError, match="bug here"):
+    with pytest.raises(LoopBindingError):
         await tool.acall("yes")
     assert tool.pending_task_id == "t-1"
     await tool.acall("yes")
@@ -178,3 +179,12 @@ async def test_local_error_keeps_pending_and_propagates():
 def test_remote_tool_error_keeps_error_type():
     err = RemoteToolError("m", A2ATimeout)
     assert err.error_type is A2ATimeout
+
+
+async def test_unclassified_task_failed_keeps_pending():
+    agent = FakeAgent(asking(task_id="t-1"), TaskFailed("remote answered HTTP 502"), done())
+    tool = RemoteTool.for_agent(agent, None, None)
+    await tool.acall("pay")
+    with pytest.raises(RemoteToolError):
+        await tool.acall("yes")
+    assert tool.pending_task_id == "t-1"  # not reported ended by the remote

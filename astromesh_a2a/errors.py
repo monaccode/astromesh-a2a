@@ -22,7 +22,17 @@ class PolicyRejected(A2AError):  # noqa: N818
 
 
 class TaskFailed(A2AError):  # noqa: N818
-    """The remote task ended in a failed/rejected/canceled state."""
+    """The remote task failed, or the call to it failed in a way we could not classify.
+
+    ``remote`` is ``True`` only when the remote itself reported the task as ended
+    (failed, rejected, canceled, not cancelable): the task is over. ``False`` for an
+    unclassified failure (an HTTP error, an unexpected SDK exception...), whose message is
+    generic and never quotes the remote: the task may still be alive.
+    """
+
+    def __init__(self, message: str, *, remote: bool = False):
+        super().__init__(message)
+        self.remote = remote
 
 
 class A2ATimeout(A2AError):  # noqa: N818

@@ -6,6 +6,7 @@ import pytest
 
 from astromesh_a2a import Policy, RemoteAgent
 from astromesh_a2a.adapters import run_sync
+from astromesh_a2a.client import LoopBindingError
 
 
 def _policy():
@@ -50,7 +51,7 @@ def test_card_on_a_closed_loop_then_sync_tool_is_a_clear_error(server, loopback)
     agent = RemoteAgent(server.base, policy=_policy())
     asyncio.run(agent.card())  # binds the agent to a loop that is now closed
     tool = agent.as_tool("crewai")
-    with pytest.raises(RuntimeError, match="bound to another event loop"):
+    with pytest.raises(LoopBindingError, match="bound to another event loop"):
         tool.run(query="hi")
     assert server.rpc_requests() == []
 
@@ -69,5 +70,5 @@ async def test_async_main_then_sync_tool_in_worker_thread(server, loopback):
 async def test_agent_refuses_a_second_loop(server, loopback):
     async with RemoteAgent(server.base, policy=_policy()) as agent:
         await agent.card()
-        with pytest.raises(RuntimeError, match="bound to another event loop"):
+        with pytest.raises(LoopBindingError, match="bound to another event loop"):
             await asyncio.to_thread(asyncio.run, agent.send("hi"))

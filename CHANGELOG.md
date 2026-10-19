@@ -73,7 +73,7 @@
   default to the cached card (the remote's description quoted as untrusted). A
   `RemoteAgent` is bound to the event loop of its first I/O and refuses others; sync
   calls (`run_sync`) are dispatched to that loop when it runs in another thread, run on
-  a background loop when the agent has none yet, and raise a clear `RuntimeError` when
+  a background loop when the agent has none yet, and raise `LoopBindingError` when
   it is closed; a sync call inside a running loop is refused. Calls on one tool are
   serialized; `RemoteTool.last_result` keeps the last `Result`. PydanticAI retries
   (`ModelRetry`) only on `A2ATimeout`; other errors are returned as the tool result.
@@ -89,9 +89,11 @@
 
 ### Changed
 
-- `RemoteAgent`: only network/remote failures (SDK errors, httpx, OS, protobuf/JSON
-  decoding) are translated to our errors; a local exception (e.g. `RuntimeError`)
-  propagates unchanged instead of becoming `TaskFailed`.
+- `RemoteAgent` is bound to the event loop of its first I/O; use from another loop raises
+  `LoopBindingError` (a local `RuntimeError`, never translated). Any other unexpected
+  exception during an RPC (e.g. an SDK bug on a malformed response) is still a generic
+  `TaskFailed` that never quotes the remote. `TaskFailed.remote` is `True` only when the
+  remote itself reported the task ended; adapters drop a pending task only then.
 
 - **Breaking:** `RemoteAgent.card()` returns a frozen `RemoteCard` (`name`, `description`,
   `version`, `interface_url`, `protocol_version`, `streaming`, `has_signatures`,

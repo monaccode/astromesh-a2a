@@ -23,7 +23,7 @@ the sync entry points of LangChain/LlamaIndex) go through ``run_sync()``:
 - the agent has no loop yet: the call runs on the adapters' background loop (one per
   process), which becomes the agent's loop;
 - the agent's loop is closed or not running (e.g. ``asyncio.run(agent.card())`` earlier):
-  ``RuntimeError``, create one ``RemoteAgent`` per loop. From plain sync code, load the
+  ``LoopBindingError``, create one ``RemoteAgent`` per loop. From plain sync code, load the
   card with ``run_sync(agent.card())`` instead.
 
 A sync call from a thread whose own loop is running is refused (it would block it).
@@ -41,7 +41,7 @@ from collections.abc import Coroutine
 from types import ModuleType
 from typing import Any, TypeVar
 
-from astromesh_a2a.client import LOOP_ERROR
+from astromesh_a2a.client import LOOP_ERROR, LoopBindingError
 from astromesh_a2a.errors import A2AError, TaskFailed
 from astromesh_a2a.types import Result
 
@@ -199,8 +199,8 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, agent: Any = None) -> _T:
 
     Without ``agent`` (or for an agent with no loop yet) it runs on the adapters'
     background loop. Raises ``RuntimeError`` when called from a thread whose event loop
-    is running (it would block that loop), or when ``agent`` is bound to a loop that is
-    closed or not running.
+    is running (it would block that loop); ``LoopBindingError`` when ``agent`` is bound
+    to a loop that is closed or not running.
     """
     try:
         asyncio.get_running_loop()
@@ -217,7 +217,7 @@ def run_sync(coro: Coroutine[Any, Any, _T], *, agent: Any = None) -> _T:
         loop = _bridge_loop()
     elif loop.is_closed() or not loop.is_running():
         coro.close()
-        raise RuntimeError(LOOP_ERROR)
+        raise LoopBindingError(LOOP_ERROR)
     return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
 
@@ -273,7 +273,9 @@ class RemoteTool:
         """Send (or reply with) ``query``; ``RemoteToolError`` on any ``A2AError``.
 
         Calls on one tool are serialized (a second call waits and sees the state the first
-        left). A local error (not an ``A2AError``) propagates and keeps the pending task.
+        left). The pending task is dropped only when the remote reports it ended
+        (``TaskFailed.remote``); a local error (e.g. ``LoopBindingError``) propagates
+        and keeps it.
         """
         if not isinstance(query, str):
             raise TypeError("query must be a str")
@@ -286,8 +288,8 @@ class RemoteTool:
                 else:
                     result = await self.agent.send(query, context_id=self.context_id)
             except A2AError as exc:
-                if isinstance(exc, TaskFailed):
-                    self.pending_task_id = None  # the task is over; next call starts anew
+                if isinstance(exc, TaskFailed) and exc.remote:
+                    self.pending_task_id = None  # the remote ended it; next call starts anew
                 raise RemoteToolError(error_message(exc), type(exc)) from None
             self.last_result = result
             self.context_id = result.context_id or self.context_id

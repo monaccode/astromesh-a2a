@@ -1,5 +1,5 @@
 from astromesh_a2a.card import CardSpec, RemoteCard, Skill
-from astromesh_a2a.client import EventStream, RemoteAgent
+from astromesh_a2a.client import EventStream, LoopBindingError, RemoteAgent
 from astromesh_a2a.errors import (
     A2AError,
     A2ATimeout,
@@ -39,6 +39,7 @@ __all__ = [
     "Event",
     "EventStream",
     "Incoming",
+    "LoopBindingError",
     "Origin",
     "Outgoing",
     "Policy",
