@@ -34,7 +34,7 @@ smolagents = ["smolagents>=1.26"]
 agent-framework = ["agent-framework>=1.19"]
 mcp = ["mcp>=1.28"]
 server = ["a2a-sdk[http-server]>=1.2,<2", "starlette>=0.40", "uvicorn>=0.30"]
-otel = ["opentelemetry-api>=1.27"]
+otel = ["opentelemetry-api>=1.33"]
 all = [
   "langchain-core>=1.6",
   "crewai>=1.15",
@@ -48,7 +48,7 @@ all = [
   "a2a-sdk[http-server]>=1.2,<2",
   "starlette>=0.40",
   "uvicorn>=0.30",
-  "opentelemetry-api>=1.27",
+  "opentelemetry-api>=1.33",
 ]
 
 [project.urls]
@@ -64,7 +64,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.sdist]
 include = ["astromesh_a2a", "tests", "examples", "docs", "README*.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
-exclude = ["uv.lock", ".superpowers", ".github"]
+exclude = ["docs/superpowers", "uv.lock", ".superpowers", ".github"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["astromesh_a2a"]
