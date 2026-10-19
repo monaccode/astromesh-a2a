@@ -67,3 +67,55 @@ async def test_client_helper_usa_safe_client():
     c = Policy(timeout=5.0).client()
     assert c.timeout.read == 5.0
     await c.aclose()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["https://[::1/", " https://a.com/x", "https://a.com/x\n", "https://a.com/\tx", "", "https://"],
+)
+def test_url_malformada_es_policy_rejected(bad):
+    with pytest.raises(PolicyRejected):
+        Policy(allowed=("a.com", "::1")).check_card_url(bad)
+
+
+@pytest.mark.parametrize(
+    "tricky",
+    [
+        "https://a.com.evil.com/x",
+        "https://a.com@evil.com/x",
+        "https://a.com:pw@evil.com/x",
+        "https://evil.com/@a.com",
+        "https://a.com./x",
+        "https://sub.a.com/x",
+    ],
+)
+def test_trucos_de_host_rechazados(tricky):
+    with pytest.raises(PolicyRejected):
+        Policy(allowed=("a.com",)).check_card_url(tricky)
+
+
+def test_puerto_y_userinfo_legitimo_se_ignoran():
+    p = Policy(allowed=("a.com",))
+    p.check_card_url("https://a.com:8443/x")
+    p.check_card_url("https://user@a.com/x")
+
+
+def test_str_pelado_rechazado():
+    with pytest.raises(TypeError):
+        Policy(allowed="a.com")
+    with pytest.raises(TypeError):
+        Policy(accept_parts="text")
+
+
+def test_segundos_negativos_y_tope():
+    m = BudgetMeter(Budget(max_seconds=1.0))
+    with pytest.raises(ValueError, match=r"seconds|reserved"):
+        m.charge_seconds(-1)
+    m.charge_seconds(1.0)
+    with pytest.raises(PolicyRejected):
+        m.charge_seconds(0.01)
+
+
+def test_max_calls_cero_rechaza_la_primera():
+    with pytest.raises(PolicyRejected):
+        BudgetMeter(Budget(max_calls=0)).charge_call()

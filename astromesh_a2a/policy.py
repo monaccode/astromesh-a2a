@@ -22,7 +22,13 @@ class Budget:
 
 @dataclass(frozen=True)
 class Policy:
-    """Client-side policy. The default allows nothing until hosts are declared."""
+    """Client-side policy. The default allows nothing until hosts are declared.
+
+    ``allowed`` entries are either bare hosts or full card URLs. Host entries match the
+    URL's hostname exactly, case-insensitively: no subdomain or suffix matching, the port
+    is ignored, and a trailing dot ("a.com.") is a different host. URL entries must match
+    the whole URL exactly (case-sensitive).
+    """
 
     allowed: tuple[str, ...] = ()
     require_signature: bool = False
@@ -34,16 +40,27 @@ class Policy:
     allow_insecure_http: bool = False
 
     def __post_init__(self) -> None:
+        if isinstance(self.allowed, str):
+            raise TypeError("Policy.allowed must be a sequence of hosts/URLs, not a bare str")
+        if isinstance(self.accept_parts, str):
+            raise TypeError("Policy.accept_parts must be a collection of kinds, not a bare str")
         object.__setattr__(self, "allowed", tuple(self.allowed))
         object.__setattr__(self, "accept_parts", frozenset(self.accept_parts))
 
     def check_card_url(self, url: str) -> None:
         """Raise PolicyRejected unless ``url`` is https (or opted-in http) and allowed."""
-        parts = urlsplit(url)
+        if not isinstance(url, str) or any(
+            c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url
+        ):
+            raise PolicyRejected("url")
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            raise PolicyRejected("url") from None
         schemes = {"https", "http"} if self.allow_insecure_http else {"https"}
         if parts.scheme.lower() not in schemes:
             raise PolicyRejected("scheme")
-        host = (parts.hostname or "").lower()
         if not host:
             raise PolicyRejected("host")
         for entry in self.allowed:
@@ -81,6 +98,8 @@ class BudgetMeter:
             raise PolicyRejected("budget")
 
     def charge_seconds(self, s: float) -> None:
+        if s < 0:
+            raise ValueError("seconds must be >= 0")
         self.seconds += s
         b = self.budget
         if b and b.max_seconds is not None and self.seconds > b.max_seconds:

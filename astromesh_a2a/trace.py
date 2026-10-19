@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import time
 from typing import Any
 
-_SECRET = re.compile(r"authorization|api[-_]?key|token|secret|password", re.IGNORECASE)
+_SECRET = re.compile(
+    r"authorization|api[-_]?key|token|secret|password|cookie|session", re.IGNORECASE
+)
 REDACTED = "[redacted]"
+_USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s?#]*@")
+_QUERY = re.compile(
+    r"([?&;](?:token|access_token|api_key|key|sig|signature|password|secret)=)[^&#\s]*",
+    re.IGNORECASE,
+)
+_SCHEME = re.compile(r"\b(Bearer|Basic)\s+[^\s,;]+", re.IGNORECASE)
+
+
+def _redact_str(s: str) -> str:
+    s = _USERINFO.sub(r"\1[redacted]@", s)
+    s = _QUERY.sub(r"\1[redacted]", s)
+    return _SCHEME.sub(r"\1 [redacted]", s)
 
 
 def _redact(value: Any) -> Any:
@@ -19,7 +34,16 @@ def _redact(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_redact(v) for v in value]
+    if isinstance(value, str):
+        return _redact_str(value)
     return value
+
+
+def _snapshot(value: Any) -> Any:
+    try:
+        return copy.deepcopy(value)
+    except Exception:  # noqa: BLE001
+        return repr(value)
 
 
 class Trace:
@@ -30,9 +54,13 @@ class Trace:
         self._entries: list[dict[str, Any]] = []
         self._last = time.monotonic()
 
-    def add(self, stage: str, **fields: Any) -> None:
+    def add(self, stage: str, /, **fields: Any) -> None:
+        if "stage" in fields or "ms" in fields:
+            raise ValueError("'stage' and 'ms' are reserved and cannot be used as fields")
         now = time.monotonic()
-        self._entries.append({"stage": stage, "ms": round((now - self._last) * 1000, 3), **fields})
+        entry = {"stage": stage, "ms": round((now - self._last) * 1000, 3)}
+        entry.update({k: _snapshot(v) for k, v in fields.items()})
+        self._entries.append(entry)
         self._last = now
 
     def to_dict(self) -> list[dict[str, Any]]:
