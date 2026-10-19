@@ -23,6 +23,9 @@ _INTERNAL_SUFFIXES = (".local", ".internal", ".svc", ".cluster.local", ".localho
 # NAT64 well-known prefix (RFC 6052): judge the embedded IPv4, not the whole prefix.
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
+_EXTRA_BLOCKED_V6 = tuple(
+    ipaddress.ip_network(n) for n in ("ff00::/8", "::ffff:0:0:0/96", "fec0::/10")
+)
 Resolver = Callable[[str, "int | None"], Awaitable[list]]
 
 
@@ -39,9 +42,12 @@ def _non_global(text: str) -> bool:
     if isinstance(ip, ipaddress.IPv6Address):
         if ip.ipv4_mapped is not None:
             ip = ip.ipv4_mapped
-        elif ip in _NAT64:
+        elif ip in _NAT64 or int(ip) < 2**32:
+            # NAT64 and IPv4-compatible (::/96): judge the embedded IPv4.
             ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-    return not ip.is_global
+        elif any(ip in n for n in _EXTRA_BLOCKED_V6):
+            return True
+    return ip.is_multicast or not ip.is_global
 
 
 def _is_internal_name(host: str) -> bool:
@@ -147,6 +153,7 @@ class PinnedTransport(httpx.AsyncBaseTransport):
         self._resolver = resolver
         self._allow_private = allow_private
         self._pins: dict[tuple, tuple[str, str, str] | None] = {}
+        self._lock = asyncio.Lock()
         self.reason: str | None = None
 
     def _note(self, reason: str) -> None:
@@ -159,28 +166,37 @@ class PinnedTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         key = (request.url.scheme, request.url.raw_host, request.url.port)
-        if self._pins and key not in self._pins:
-            raise self._fail(
-                f"Blocked: this transport serves only one host, not {request.url.host}"
-            )
-        if key not in self._pins:
-            pin = None
-            if not self._allow_private:
-                reason = blocked_reason(str(request.url))
-                if reason:
-                    raise self._fail(reason)
-                try:
-                    pin = await pin_to_public_ip(str(request.url), self._resolver)
-                except BlockedDestination as exc:
-                    raise self._fail(exc.reason) from exc
-            self._pins[key] = pin
-        pin = self._pins[key]
+        async with self._lock:  # claim the host atomically: check + resolve + pin
+            if self._pins and key not in self._pins:
+                raise self._fail(
+                    f"Blocked: this transport serves only one host, not {request.url.host}"
+                )
+            if key not in self._pins:
+                pin = None
+                if not self._allow_private:
+                    reason = blocked_reason(str(request.url))
+                    if reason:
+                        raise self._fail(reason)
+                    try:
+                        pin = await pin_to_public_ip(str(request.url), self._resolver)
+                    except BlockedDestination as exc:
+                        raise self._fail(exc.reason) from exc
+                self._pins[key] = pin
+            pin = self._pins[key]
+        original = request
         if pin is not None:
             pinned_url, sni, host_header = pin
-            request.url = request.url.copy_with(host=httpx.URL(pinned_url).host)
+            # Work on a copy so the caller's request/response keep the real hostname.
+            request = httpx.Request(
+                request.method,
+                request.url.copy_with(host=httpx.URL(pinned_url).host),
+                headers=request.headers,
+                stream=request.stream,
+                extensions=dict(request.extensions),
+            )
             request.headers["Host"] = host_header
             if request.url.scheme == "https":
-                request.extensions = {**request.extensions, "sni_hostname": sni}
+                request.extensions["sni_hostname"] = sni
         request.headers["Accept-Encoding"] = "identity"
         try:
             response = await self._inner.handle_async_request(request)
@@ -198,7 +214,7 @@ class PinnedTransport(httpx.AsyncBaseTransport):
             headers=response.headers,
             stream=_BoundedBody(response.stream, self.max_bytes, self),
             extensions=response.extensions,
-            request=request,
+            request=original,
         )
 
     async def aclose(self) -> None:
@@ -210,9 +226,13 @@ def safe_client(
 ) -> httpx.AsyncClient:
     """An ``httpx.AsyncClient`` whose every request passes the egress guard.
 
-    No redirects. ``allow_private`` lifts only the public-address rule (for a
+    One host per client (the transport pins the first host it sees; use one client per
+    remote). ``mounts`` and ``proxy`` are rejected: they would bypass the guard. No
+    redirects. ``allow_private`` lifts only the public-address rule (for a
     deployment that opts in on purpose); the body cap and no-redirect rules stay.
     """
+    if "mounts" in kwargs or "proxy" in kwargs or "transport" in kwargs:
+        raise ValueError("safe_client does not accept 'mounts', 'proxy' or 'transport'")
     return httpx.AsyncClient(
         transport=PinnedTransport(max_bytes=max_bytes, allow_private=allow_private),
         timeout=timeout,

@@ -21,6 +21,14 @@ from astromesh_a2a.net import PinnedTransport, blocked_reason, safe_client
         "[fe80::1]",
         "[::ffff:10.0.0.1]",
         "[64:ff9b::a00:5]",
+        "[::10.0.0.1]",
+        "[::a00:1]",
+        "[::7f00:1]",
+        "224.0.0.1",
+        "239.255.255.250",
+        "[ff02::1]",
+        "[::ffff:0:10.0.0.1]",
+        "[fec0::1]",
         "localhost",
         "redis",
         "db.svc",
@@ -201,3 +209,44 @@ async def test_safe_client_config():
             await c.get("http://127.0.0.1:1/")
     finally:
         await c.aclose()
+
+
+async def test_dns_ipv4_compatible_blocked():
+    seen = []
+    t = PinnedTransport(inner=inner_ok(seen), resolver=fake_resolver("::a00:5"))
+    async with httpx.AsyncClient(transport=t) as c:
+        with pytest.raises(BlockedDestination):
+            await c.get("https://agent.example.com/")
+    assert seen == []
+
+
+async def test_concurrent_first_requests_one_host_only():
+    import asyncio
+
+    async def slow(host, port):
+        await asyncio.sleep(0.01)
+        return [(2, 1, 6, "", ("8.8.8.8", 0))]
+
+    t = PinnedTransport(inner=inner_ok(), resolver=slow)
+    async with httpx.AsyncClient(transport=t) as c:
+        res = await asyncio.gather(
+            c.get("https://a.example.com/"),
+            c.get("https://b.example.com/"),
+            return_exceptions=True,
+        )
+    assert sum(isinstance(r, BlockedDestination) for r in res) == 1
+    assert sum(isinstance(r, httpx.Response) for r in res) == 1
+
+
+async def test_response_keeps_hostname():
+    t = PinnedTransport(inner=inner_ok(), resolver=fake_resolver("8.8.8.8"))
+    async with httpx.AsyncClient(transport=t) as c:
+        r = await c.get("https://agent.example.com/x")
+    assert r.request.url.host == "agent.example.com"
+    assert r.url.host == "agent.example.com"
+
+
+async def test_safe_client_rejects_bypass_kwargs():
+    for kw in ({"mounts": {}}, {"proxy": "http://p:1"}):
+        with pytest.raises(ValueError, match="does not accept"):
+            safe_client(timeout=1.0, max_bytes=1, **kw)
