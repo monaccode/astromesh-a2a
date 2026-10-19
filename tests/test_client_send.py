@@ -55,6 +55,121 @@ async def test_data_part_rechazada_por_politica(server, loopback):
     assert exc.value.reason == "part_kind:data"
 
 
+async def test_parte_no_aceptada_se_descarta(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        result = await agent.send("mixed")
+    assert result.status == "completed"
+    assert result.answer == "see file"
+    assert result.data == []
+    rejections = [e for e in result.trace if e["stage"] == "rejection"]
+    assert rejections == [
+        {
+            "stage": "rejection",
+            "ms": rejections[0]["ms"],
+            "kind": "file",
+            "reason": "part_kind:file",
+        }
+    ]
+
+
+async def test_solo_partes_no_aceptadas_rechaza(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        with pytest.raises(PolicyRejected) as exc:
+            await agent.send("file")
+    assert exc.value.reason == "part_kind:file"
+
+
+async def test_pending_conserva_texto_y_descarta_archivo(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        result = await agent.send("askfile")
+    assert result.status == "input_required"
+    assert result.pending == "which?"
+    assert any(e["stage"] == "rejection" for e in result.trace)
+
+
+@pytest.mark.parametrize(
+    "url", ["https://a.example.com/?x=1", "https://a.example.com/#f", "https://a.example.com?"]
+)
+def test_url_base_con_query_o_fragmento(url):
+    with pytest.raises(PolicyRejected) as exc:
+        RemoteAgent(url, policy=Policy(allowed=("a.example.com",)))
+    assert exc.value.reason == "url"
+
+
+def test_url_base_y_url_de_card():
+    policy = Policy(allowed=("a.example.com",))
+    assert RemoteAgent("https://a.example.com", policy=policy)._fetch_url == (
+        "https://a.example.com/.well-known/agent-card.json"
+    )
+    assert RemoteAgent("https://a.example.com/", policy=policy)._fetch_url == (
+        "https://a.example.com/.well-known/agent-card.json"
+    )
+    card = "https://a.example.com/agents/x.json?v=2"
+    assert RemoteAgent(card, policy=policy)._fetch_url == card
+
+
+def _walk(exc):
+    seen = []
+    while exc is not None:
+        assert all(exc is not s for s in seen), "cyclic exception chain"
+        seen.append(exc)
+        exc = exc.__cause__ or exc.__context__
+    return seen
+
+
+async def test_cadena_de_errores_aciclica(server, loopback, monkeypatch):
+    from a2a.client import A2AClientError
+
+    ours = BlockedDestination("Blocked: x")
+
+    async def wrapped(*args):
+        try:
+            raise ours
+        except BlockedDestination as exc:
+            raise A2AClientError("wrapped") from exc
+
+    async def plain(*args):
+        raise A2AClientError("plain")
+
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        monkeypatch.setattr(agent, "_send_blocking", wrapped)
+        with pytest.raises(BlockedDestination) as exc:
+            await agent.send("hello")
+        assert exc.value is ours
+        _walk(exc.value)
+
+        monkeypatch.setattr(agent, "_send_blocking", plain)
+        with pytest.raises(TaskFailed) as exc2:
+            await agent.send("hello")
+        assert isinstance(exc2.value.__cause__, A2AClientError)
+        _walk(exc2.value)
+
+
+def test_version_no_soportada_mensaje_acotado():
+    from a2a.types import AgentCard, AgentInterface
+
+    from astromesh_a2a.client import _select_interface
+
+    card = AgentCard(
+        supported_interfaces=[
+            AgentInterface(url="https://a/x", protocol_binding="JSONRPC", protocol_version=f"0.{n}")
+            for n in range(8)
+        ]
+    )
+    with pytest.raises(UnsupportedVersion) as exc:
+        _select_interface(card)
+    assert str(exc.value) == "remote speaks A2A 0.0, 0.1, 0.2, 0.3, 0.4, ...; need 1.x"
+
+
+async def test_data_no_serializable_es_type_error(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        with pytest.raises(TypeError):
+            await agent.send("hello", data={"x": object()})
+        with pytest.raises(TypeError):
+            await agent.send("hello", data=["not", "a", "dict"])
+    assert server.requests == []
+
+
 async def test_card(server, loopback):
     async with RemoteAgent(server.base + "/.well-known/agent-card.json", policy=_policy()) as a:
         card = await a.card()

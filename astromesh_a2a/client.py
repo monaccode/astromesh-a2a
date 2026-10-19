@@ -29,9 +29,9 @@ import contextlib
 import json
 import sys
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from a2a.client import A2AClientTimeoutError, ClientCallContext, ClientConfig, ClientFactory
@@ -65,6 +65,7 @@ from astromesh_a2a.types import Auth, Origin, Result
 WELL_KNOWN_CARD = "/.well-known/agent-card.json"
 A2A_VERSION = "1.0"
 _MAX_REMOTE_TEXT = 200
+_MAX_VERSIONS_SHOWN = 5
 
 if sys.version_info >= (3, 11):
     _deadline = asyncio.timeout
@@ -108,6 +109,31 @@ def _remote_text(text: str) -> str:
     return text if len(text) <= _MAX_REMOTE_TEXT else text[:_MAX_REMOTE_TEXT] + "..."
 
 
+def _card_fetch_url(card_url: str) -> str:
+    """The card URL itself, or ``<base>/.well-known/agent-card.json`` for a base URL.
+
+    A base URL (empty or ``/`` path) with a query or fragment is ambiguous: refused.
+    """
+    parts = urlsplit(card_url)
+    if parts.path not in ("", "/"):
+        return card_url
+    if parts.query or parts.fragment or card_url.endswith(("?", "#")):
+        raise PolicyRejected("url")
+    return urlunsplit((parts.scheme, parts.netloc, WELL_KNOWN_CARD, "", ""))
+
+
+def _json_data(data: Any) -> dict[str, Any] | None:
+    """Outgoing ``data`` as a JSON object (str keys); TypeError if it is not one."""
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise TypeError("data must be a dict")
+    try:
+        return json.loads(json.dumps(data, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"data is not JSON-serializable: {exc}") from None
+
+
 def _parts_text(parts: Any) -> str:
     return "\n".join(p.text for p in parts if p.WhichOneof("content") == "text")
 
@@ -137,8 +163,7 @@ class RemoteAgent:
         self.policy = policy
         self.auth = auth
         self.origin = Origin(origin)
-        path = urlsplit(card_url).path
-        self._fetch_url = card_url.rstrip("/") + WELL_KNOWN_CARD if path in ("", "/") else card_url
+        self._fetch_url = _card_fetch_url(card_url)
         self._lock = asyncio.Lock()
         self._card: AgentCard | None = None
         self._interface: AgentInterface | None = None
@@ -267,6 +292,7 @@ class RemoteAgent:
     ) -> Result:
         """Send one message and wait for the task to finish or ask for input."""
         self._check_open()
+        data = _json_data(data)
         trace = Trace()
         try:
             async with _deadline(self.policy.timeout):
@@ -276,9 +302,11 @@ class RemoteAgent:
             raise A2ATimeout(f"remote call exceeded {self.policy.timeout}s") from None
         except A2AError:
             raise
-        except Exception as exc:
-            raise _translate(exc) from exc
-        return self._to_result(final, trace)
+        except Exception as exc:  # noqa: BLE001 - translated below, never passed through
+            failure = exc
+        else:
+            return self._to_result(final, trace)
+        raise _translated(failure)  # outside the handler: no implicit __context__ cycle
 
     async def _send_blocking(
         self, text: str, context_id: str | None, data: dict | None, trace: Trace
@@ -315,7 +343,7 @@ class RemoteAgent:
         kind = event.WhichOneof("payload")
         if kind == "message":
             msg = event.message
-            answer, data = self._accept(msg.parts)
+            answer, data = self._accept(msg.parts, trace)
             return self._finish(trace, "completed", answer, data, msg.task_id, msg.context_id, None)
         if kind != "task":
             raise TaskFailed(f"unexpected final event {kind!r}")
@@ -325,11 +353,13 @@ class RemoteAgent:
         status_text = _parts_text(task.status.message.parts)
         if state == TaskState.TASK_STATE_COMPLETED:
             parts = [p for a in task.artifacts for p in a.parts] or list(task.status.message.parts)
-            answer, data = self._accept(parts)
+            answer, data = self._accept(parts, trace)
             return self._finish(trace, "completed", answer, data, task.id, task.context_id, None)
         if state in (TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED):
-            self._accept(task.status.message.parts)
-            return self._finish(trace, name.lower(), "", [], task.id, task.context_id, status_text)
+            question, _ = self._accept(task.status.message.parts, trace)
+            return self._finish(
+                trace, name.lower(), "", [], task.id, task.context_id, question or None
+            )
         if state in (TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING):
             raise A2ATimeout(f"remote task did not finish (state {name})")
         detail = f": {_remote_text(status_text)}" if status_text else ""
@@ -356,12 +386,25 @@ class RemoteAgent:
             trace=trace.to_dict(),
         )
 
-    def _accept(self, parts: Any) -> tuple[str, list[dict[str, Any]]]:
-        """Apply ``accept_parts``/``max_bytes`` to each part; text joined, rest as data."""
+    def _accept(self, parts: Any, trace: Trace) -> tuple[str, list[dict[str, Any]]]:
+        """Apply ``accept_parts``/``max_bytes`` to each part; text joined, rest as data.
+
+        A part of a kind the policy does not accept is DROPPED (noted in the trace as a
+        ``rejection``); ``PolicyRejected`` only when parts existed and none was accepted.
+        An oversized part is always a hard ``PolicyRejected("part_size")``.
+        """
         texts: list[str] = []
         data: list[dict[str, Any]] = []
+        rejected: list[str] = []
         for part in parts:
             kind = part.WhichOneof("content")
+            policy_kind = {"raw": "file", "url": "file"}.get(kind or "", kind)
+            if policy_kind is None:
+                continue
+            if policy_kind not in self.policy.accept_parts:
+                rejected.append(policy_kind)
+                trace.add("rejection", kind=policy_kind, reason=f"part_kind:{policy_kind}")
+                continue
             if kind == "text":
                 self.policy.check_part("text", len(part.text.encode()))
                 texts.append(part.text)
@@ -391,6 +434,8 @@ class RemoteAgent:
                         }
                     }
                 )
+        if rejected and not texts and not data:
+            raise PolicyRejected(f"part_kind:{rejected[0]}")
         return "\n".join(texts), data
 
 
@@ -402,9 +447,9 @@ def _select_interface(card: AgentCard) -> AgentInterface:
     v1 = [i for i in jsonrpc if i.protocol_version.split(".")[0] == "1"]
     if not v1:
         versions = sorted({i.protocol_version or "(none)" for i in jsonrpc})
-        raise UnsupportedVersion(
-            f"remote speaks A2A {', '.join(_remote_text(v) for v in versions)}; need 1.x"
-        )
+        shown = ", ".join(_remote_text(v) for v in versions[:_MAX_VERSIONS_SHOWN])
+        more = ", ..." if len(versions) > _MAX_VERSIONS_SHOWN else ""
+        raise UnsupportedVersion(f"remote speaks A2A {shown}{more}; need 1.x")
     exact = [i for i in v1 if i.protocol_version in ("1.0", "1.0.0")]
     return (exact or v1)[0]
 
@@ -434,22 +479,41 @@ def _verify_signature(card: AgentCard, policy: Policy) -> None:
         raise PolicyRejected("signature") from None
 
 
+def _chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and its causes/contexts, each once (safe on cyclic chains)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _translated(exc: BaseException) -> A2AError:
+    """Our error for ``exc``, to be raised OUTSIDE the ``except`` block.
+
+    One of ours already in ``exc``'s chain comes back untouched: chaining it to ``exc``
+    (``from exc``, or raising it inside the handler, which sets ``__context__``) would
+    make the chain cyclic. A new error gets ``exc`` as its ``__cause__``.
+    """
+    error = _translate(exc)
+    if not any(e is error for e in _chain(exc)):
+        error.__cause__ = exc
+    return error
+
+
 def _translate(exc: BaseException) -> A2AError:
     """Map an SDK/httpx failure to our errors, without passing remote text through."""
-    seen: BaseException | None = exc
-    while seen is not None:
+    for seen in _chain(exc):
         if isinstance(seen, A2AError):
             return seen
-        seen = seen.__cause__ or seen.__context__
     if isinstance(exc, sdk_errors.VersionNotSupportedError):
         return UnsupportedVersion(f"remote rejected A2A-Version {A2A_VERSION}")
     if isinstance(exc, sdk_errors.ContentTypeNotSupportedError):
         return PolicyRejected("content_type")
     if isinstance(exc, (A2AClientTimeoutError, httpx.TimeoutException)):
         return A2ATimeout("remote call timed out")
-    cause: BaseException | None = exc
-    while cause is not None:
+    for cause in _chain(exc):
         if isinstance(cause, httpx.HTTPStatusError):
             return TaskFailed(f"remote answered HTTP {cause.response.status_code}")
-        cause = cause.__cause__ or cause.__context__
     return TaskFailed(f"remote error: {type(exc).__name__}")

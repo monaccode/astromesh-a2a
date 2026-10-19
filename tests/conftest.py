@@ -40,6 +40,7 @@ from a2a.types import (
     AgentCard,
     AgentInterface,
     AgentSkill,
+    Part,
     TaskState,
 )
 from a2a.utils.constants import TransportProtocol
@@ -96,7 +97,15 @@ class EchoExecutor(AgentExecutor):
         if text == "ask":
             await up.requires_input(up.new_agent_message([new_text_part("which city?")]))
             return
-        if text == "data":
+        file_part = Part(raw=b"\x89PNG", media_type="image/png", filename="x.png")
+        if text == "askfile":
+            await up.requires_input(up.new_agent_message([file_part, new_text_part("which?")]))
+            return
+        if text == "mixed":
+            await up.add_artifact([new_text_part("see file"), file_part], name="answer")
+        elif text == "file":
+            await up.add_artifact([file_part], name="answer")
+        elif text == "data":
             await up.add_artifact([new_data_part({"temp": 21})], name="answer")
         else:
             await up.add_artifact([new_text_part(f"echo:{text}")], name="answer")
