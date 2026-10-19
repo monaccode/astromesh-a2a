@@ -49,10 +49,12 @@ class Recorder:
             raise RuntimeError("db password is hunter2 at /srv/internal")
         if incoming.text == "transfer":
             return Outgoing(needs_confirmation="Respond 'yes' to confirm the transfer")
-        if incoming.task_id and incoming.text == "yes":
+        if incoming.is_reply and incoming.text == "yes":
             # A remote "yes" is just more untrusted input; the handler decides. Here it
             # keeps asking, because only a human on THIS side may confirm.
             return Outgoing(needs_confirmation="A human must confirm this transfer")
+        if incoming.text == "slow":
+            await asyncio.sleep(5)
         if incoming.text == "data":
             return Outgoing(answer="here", data=[{"temp": 21}])
         return Outgoing(answer=f"got:{incoming.text}", data=incoming.data)
@@ -423,3 +425,93 @@ def test_exportaciones_perezosas():
     assert astromesh_a2a.api_key_auth is server_mod.api_key_auth
     with pytest.raises(AttributeError):
         _ = astromesh_a2a.nope
+
+
+async def test_reply_vs_primer_mensaje_yes(live, loopback):
+    """A first message "yes" is not a reply; a real reply carries the pending question."""
+    base, recorder = live
+    async with RemoteAgent(base, policy=_policy(), auth=Auth.api_key(ENV)) as agent:
+        fresh = await agent.send("yes")
+        first = await agent.send("transfer")
+        await agent.reply(first.task_id, "yes")
+    assert fresh.status == "completed"  # the handler saw no reply: nothing to confirm
+    lone, ask, reply = recorder.seen
+    assert lone.task_id  # always set: the SDK generates one
+    assert (lone.is_reply, lone.pending) == (False, None)
+    assert (ask.is_reply, ask.pending) == (False, None)
+    assert reply.is_reply is True
+    assert reply.pending == "Respond 'yes' to confirm the transfer"
+    assert reply.task_id == ask.task_id
+
+
+async def test_session_key_separa_identidades():
+    async def auth(request):
+        return request.headers.get("x-who") or False
+
+    recorder = Recorder()
+    app = create_app(recorder, _card(), auth=auth)
+    message = {"messageId": "m", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+    async with _asgi(app) as hx:
+        for who in ("alice", "bob", "a:b"):
+            m = {**message, "messageId": f"m-{who}", "contextId": "shared-ctx"}
+            r = await hx.post(
+                "/a2a", json=_rpc(message=m), headers={"x-who": who, "A2A-Version": "1.0"}
+            )
+            assert r.status_code == 200
+    keys = [i.session_key for i in recorder.seen]
+    assert [i.context_id for i in recorder.seen] == ["shared-ctx"] * 3
+    assert keys == ["alice:shared-ctx", "bob:shared-ctx", "a%3Ab:shared-ctx"]
+    assert len(set(keys)) == 3
+
+
+async def test_session_key_insecure_sin_identidad():
+    recorder = Recorder()
+    app = create_app(recorder, _card(), auth=None, insecure=True)
+    m = {"messageId": "m", "role": "ROLE_USER", "parts": [{"text": "hi"}], "contextId": "c1"}
+    async with _asgi(app) as hx:
+        await hx.post("/a2a", json=_rpc(message=m), headers={"A2A-Version": "1.0"})
+    assert recorder.seen[0].session_key == ":c1"
+    assert recorder.seen[0].caller is None
+
+
+async def test_handler_timeout_es_failed(key_env, caplog):
+    recorder = Recorder()
+    app = create_app(recorder, _card(), auth=api_key_auth(ENV), handler_timeout=0.1)
+    started = time.monotonic()
+    with caplog.at_level(logging.ERROR, logger="astromesh_a2a.server"):
+        async with _asgi(app) as hx:
+            r = await hx.post("/a2a", json=_rpc("slow"), headers=HEADERS)
+    assert time.monotonic() - started < 3
+    status = r.json()["result"]["task"]["status"]
+    assert status["state"] == "TASK_STATE_FAILED"
+    assert status["message"]["parts"] == [{"text": FAILED_TEXT}]
+    assert "timed out" in caplog.text
+    with pytest.raises(ValueError, match="handler_timeout"):
+        create_app(recorder, _card(), auth=api_key_auth(ENV), handler_timeout=0)
+
+
+def test_lifespan_cierra_handler_y_task_store(key_env, monkeypatch):
+    from a2a.server.tasks import InMemoryTaskStore
+    from starlette.testclient import TestClient
+
+    closed: list[bool] = []
+
+    async def fake_aclose(self):
+        closed.append(True)
+
+    monkeypatch.setattr(server_mod.DefaultRequestHandler, "aclose", fake_aclose)
+    saved: list[str] = []
+
+    class Store(InMemoryTaskStore):
+        async def save(self, task, context):
+            saved.append(task.id)
+            await super().save(task, context)
+
+    store = Store()
+    app = create_app(Recorder(), _card(), auth=api_key_auth(ENV), task_store=store)
+    with TestClient(app) as tc:
+        r = tc.post("/a2a", json=_rpc("hi"), headers=HEADERS)
+        task_id = r.json()["result"]["task"]["id"]
+        assert closed == []
+    assert closed == [True]
+    assert task_id in saved  # our store was used

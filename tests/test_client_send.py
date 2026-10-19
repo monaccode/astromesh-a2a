@@ -182,7 +182,8 @@ async def test_card(server, loopback):
     assert card.interface_url == server.base + "/a2a"
     assert card.protocol_version == "1.0"
     assert card.streaming is True
-    assert card.signed is False
+    assert card.has_signatures is False
+    assert card.signature_verified is False
     assert card.skills == (
         Skill(
             id="echo",
@@ -199,13 +200,19 @@ async def test_card(server, loopback):
     assert "raw" not in repr(card)
 
 
-async def test_card_firmada_es_signed(server, loopback):
+async def test_card_firmada_has_signatures_vs_verified(server, loopback):
+    url = server.base + "/signed/agent-card.json"
+    async with RemoteAgent(url, policy=_policy()) as a:  # signature carried, not checked
+        card = await a.card()
+    assert card.has_signatures is True
+    assert card.signature_verified is False
     policy = _policy(
         require_signature=True, signing_keys={"k1": SIGNING_KEY}, signing_algorithms=["HS256"]
     )
     async with RemoteAgent(server.base + "/signed/agent-card.json", policy=policy) as a:
         card = await a.card()
-    assert card.signed is True
+    assert card.has_signatures is True
+    assert card.signature_verified is True
 
 
 async def test_card_fuera_de_politica_no_envia(server, loopback):

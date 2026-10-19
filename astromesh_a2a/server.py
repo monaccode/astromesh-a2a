@@ -19,6 +19,9 @@ What the app does around the SDK (ADR 0001 §2, §6):
   (VersionNotSupported). The v0.3 compat layer stays off.
 - **Input:** text and data parts become an ``Incoming`` with ``origin=Origin.AGENT`` and
   ``untrusted=True`` no matter what the remote claims; file parts are dropped (logged).
+  ``is_reply``/``pending`` tell a reply to a waiting task from a new message;
+  ``session_key`` (caller + context id) is what to key memory by.
+- **Limits:** ``handler_timeout`` per handler call (default 300 s) → ``failed``.
 - **Output:** ``Outgoing`` → artifact ``answer`` + ``completed``; ``needs_confirmation``
   → ``input_required`` with that text. A handler exception → ``failed`` with a generic
   message; details only go to the local log.
@@ -31,8 +34,10 @@ import hmac
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import quote
 
 try:
     from a2a.helpers import new_task, new_text_part
@@ -40,7 +45,7 @@ try:
     from a2a.server.events import EventQueue
     from a2a.server.request_handlers import DefaultRequestHandler
     from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-    from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+    from a2a.server.tasks import InMemoryTaskStore, TaskStore, TaskUpdater
     from a2a.types import (
         APIKeySecurityScheme,
         Part,
@@ -61,7 +66,14 @@ except ImportError as exc:  # pragma: no cover - depends on the installed extras
 from astromesh_a2a.card import RPC_PATH, CardSpec
 from astromesh_a2a.types import Incoming, Origin, Outgoing
 
-__all__ = ["DEFAULT_MAX_BODY_BYTES", "Handler", "api_key_auth", "create_app", "serve"]
+__all__ = [
+    "DEFAULT_HANDLER_TIMEOUT",
+    "DEFAULT_MAX_BODY_BYTES",
+    "Handler",
+    "api_key_auth",
+    "create_app",
+    "serve",
+]
 
 log = logging.getLogger("astromesh_a2a.server")
 
@@ -73,6 +85,8 @@ DEFAULT_MAX_BODY_BYTES = 1_048_576
 FAILED_TEXT = "The agent could not process this request."
 _MAX_CLAIM = 64
 _SHARED_IDENTITY = "authenticated"
+_WAITING = (TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED)
+DEFAULT_HANDLER_TIMEOUT = 300.0
 
 
 def api_key_auth(env: str, header: str = "X-API-Key") -> AuthCallable:
@@ -120,15 +134,27 @@ def _incoming(context: RequestContext) -> Incoming:
             claimed = origin.string_value[:_MAX_CLAIM]
     if dropped:
         log.info("dropped %d non text/data part(s) on task %s", dropped, context.task_id)
+    if claimed is not None:
+        log.debug("task %s: remote claims origin %r (treated as agent)", context.task_id, claimed)
     user = context.call_context.user if context.call_context else None
-    caller = user.user_name if user is not None and user.is_authenticated else None
+    caller = (user.user_name if user is not None and user.is_authenticated else "") or ""
+    context_id = context.context_id or ""
+    task = context.current_task
+    pending = None
+    if task is not None and task.status.state in _WAITING:
+        pending = "\n".join(
+            p.text for p in task.status.message.parts if p.WhichOneof("content") == "text"
+        )
     return Incoming(
         text="\n".join(texts),
         data=data,
         origin=Origin.AGENT,
-        context_id=context.context_id or "",
+        context_id=context_id,
         untrusted=True,
         task_id=context.task_id,
+        is_reply=task is not None,
+        pending=pending,
+        session_key=f"{quote(caller, safe='')}:{context_id}",
         claimed_origin=claimed,
         caller=caller or None,
     )
@@ -158,10 +184,12 @@ def _data_part(item: dict[str, Any]) -> Part:
 class _HandlerExecutor(AgentExecutor):
     """Runs the user's handler for each message (a new task, or a reply to one)."""
 
-    def __init__(self, handler: Handler):
+    def __init__(self, handler: Handler, timeout: float | None):
         self.handler = handler
+        self.timeout = timeout
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        incoming = _incoming(context)  # before any event: reads the task as it was
         if context.current_task is None:  # the SDK needs the Task before any status
             history = [context.message] if context.message is not None else []
             await event_queue.enqueue_event(
@@ -175,11 +203,15 @@ class _HandlerExecutor(AgentExecutor):
         up = TaskUpdater(event_queue, context.task_id, context.context_id)
         await up.start_work()
         try:
-            out = _outgoing(await self.handler(_incoming(context)))
+            out = _outgoing(await asyncio.wait_for(self.handler(incoming), self.timeout))
             parts = [new_text_part(out.answer)] if out.answer else []
             parts += [_data_part(item) for item in out.data]
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            log.error("handler timed out after %ss on task %s", self.timeout, context.task_id)
+            await up.failed(up.new_agent_message([new_text_part(FAILED_TEXT)]))
+            return
         except Exception:
             log.exception("handler failed on task %s", context.task_id)
             await up.failed(up.new_agent_message([new_text_part(FAILED_TEXT)]))
@@ -318,12 +350,24 @@ def create_app(
     auth: AuthCallable | None,
     insecure: bool = False,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    handler_timeout: float | None = DEFAULT_HANDLER_TIMEOUT,
+    task_store: TaskStore | None = None,
 ) -> Starlette:
     """A Starlette app serving ``handler`` as an A2A agent described by ``card``.
 
     ``auth`` is required (``api_key_auth(...)`` or any ``async (Request) -> bool | str``);
-    ``insecure=True`` serves without it (local experiments only). Mountable under a
-    sub-path: then ``card.url`` must include that path.
+    ``insecure=True`` serves without it (local experiments only). With ``insecure`` every
+    caller has the same (empty) identity, so all callers SHARE tasks: anyone can read or
+    cancel anyone's task by id.
+
+    ``handler_timeout`` (seconds, ``None`` = no limit) caps each handler call; past it the
+    task fails with the generic message. ``task_store`` defaults to the SDK's
+    ``InMemoryTaskStore``: lost on restart and unbounded (it keeps every task), fine for
+    development; pass a persistent/bounded ``TaskStore`` in production.
+
+    Mountable under a sub-path: then ``card.url`` must include that path. The app's
+    lifespan closes the SDK request handler on shutdown; a mounted sub-app's lifespan does
+    not run under Starlette, so the host app should call that cleanup itself if needed.
     """
     if not callable(handler):
         raise TypeError("handler must be an async callable")
@@ -335,21 +379,31 @@ def create_app(
         raise TypeError("auth must be an async callable")
     if not isinstance(max_body_bytes, int) or max_body_bytes <= 0:
         raise ValueError("max_body_bytes must be a positive int")
+    if handler_timeout is not None and not handler_timeout > 0:
+        raise ValueError("handler_timeout must be > 0 or None")
     if auth is None:
         log.warning("A2A server %r runs WITHOUT authentication (insecure=True)", card.name)
     agent_card = card.to_proto()
     if auth is not None:
         _security(agent_card, auth)
     request_handler = DefaultRequestHandler(
-        agent_executor=_HandlerExecutor(handler),
-        task_store=InMemoryTaskStore(),
+        agent_executor=_HandlerExecutor(handler, handler_timeout),
+        task_store=task_store if task_store is not None else InMemoryTaskStore(),
         agent_card=agent_card,
     )
     routes = [
         *create_agent_card_routes(agent_card, card_url=CARD_PATH),
         *create_jsonrpc_routes(request_handler, rpc_url=RPC_PATH),
     ]
-    app = Starlette(routes=routes)
+
+    @asynccontextmanager
+    async def lifespan(_: Starlette) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await request_handler.aclose()
+
+    app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(_Guard, auth=auth, max_body_bytes=max_body_bytes)
     return app
 
@@ -363,10 +417,20 @@ def serve(
     auth: AuthCallable | None = None,
     insecure: bool = False,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    handler_timeout: float | None = DEFAULT_HANDLER_TIMEOUT,
+    task_store: TaskStore | None = None,
 ) -> None:
     """Run ``create_app(...)`` under uvicorn (blocks). Refuses to start without ``auth``
-    unless ``insecure=True``."""
-    app = create_app(handler, card, auth=auth, insecure=insecure, max_body_bytes=max_body_bytes)
+    unless ``insecure=True``. Same options as ``create_app``."""
+    app = create_app(
+        handler,
+        card,
+        auth=auth,
+        insecure=insecure,
+        max_body_bytes=max_body_bytes,
+        handler_timeout=handler_timeout,
+        task_store=task_store,
+    )
     try:
         import uvicorn
     except ImportError:

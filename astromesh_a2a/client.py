@@ -291,7 +291,8 @@ class RemoteAgent:
                 card = await self._vetted_card(Trace())
         except TimeoutError:
             raise A2ATimeout(f"card fetch exceeded {self.policy.timeout}s") from None
-        return RemoteCard.from_proto(card)
+        # A vetted card under require_signature passed _verify_signature (else it raised).
+        return RemoteCard.from_proto(card, signature_verified=self.policy.require_signature)
 
     async def _vetted_card(self, trace: Trace) -> AgentCard:
         async with self._lock:

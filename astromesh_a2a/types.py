@@ -96,9 +96,18 @@ class Incoming:
     ``origin`` is ALWAYS ``Origin.AGENT`` and ``untrusted`` always ``True``: the sender is
     another program, whatever it claims. ``claimed_origin`` is the ``origin`` the remote
     wrote in its message metadata (e.g. ``"human"``), kept for logging only; never use it
-    to decide anything. A reply to a task that asked for confirmation arrives the same way
-    (``task_id`` set): a remote "yes" is not a human confirmation, and this library never
-    marks anything as confirmed.
+    to decide anything.
+
+    ``task_id`` is always set (the SDK generates one for a new task). ``is_reply`` is
+    ``True`` only when the message continues an existing task; then ``pending`` holds the
+    question that task was waiting on (its ``input_required`` text), else ``None``. A
+    reply to a confirmation arrives exactly like this: a remote "yes" is not a human
+    confirmation, and this library never marks anything as confirmed.
+
+    ``context_id`` is chosen by the caller and NOT scoped: two callers can send the same
+    one. Key any memory/session state by ``session_key`` (``"<caller>:<context_id>"``,
+    caller percent-encoded, ``""`` when the server runs ``insecure``), never by
+    ``context_id`` alone. ``caller`` is the identity returned by the ``auth`` callable.
     """
 
     text: str
@@ -107,6 +116,9 @@ class Incoming:
     context_id: str
     untrusted: bool = True
     task_id: str | None = None
+    is_reply: bool = False
+    pending: str | None = None
+    session_key: str = ""
     claimed_origin: str | None = None
     caller: str | None = None
 

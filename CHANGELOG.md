@@ -53,12 +53,18 @@
   `untrusted=True`, whatever the remote claims (`claimed_origin` kept for logging only);
   file parts are dropped. `Outgoing.needs_confirmation` puts the task in `input_required`;
   the remote's reply comes back as untrusted input and the library never marks anything
-  as confirmed. A handler exception fails the task with a generic message; details stay
-  in the local log.
+  as confirmed. `Incoming.is_reply`/`pending` tell a reply to a waiting task (and the
+  question it waited on) from a new message; `Incoming.session_key`
+  (`"<caller>:<context_id>"`) is what to key memory by, since `context_id` is chosen by the
+  caller. A handler exception, or a handler running past `handler_timeout` (default
+  300 s), fails the task with a generic message; details stay in the local log.
+- `create_app`/`serve` take `task_store=` (default: the SDK's unbounded in-memory store);
+  the app's lifespan closes the SDK request handler on shutdown.
 
 ### Changed
 
 - **Breaking:** `RemoteAgent.card()` returns a frozen `RemoteCard` (`name`, `description`,
-  `version`, `interface_url`, `protocol_version`, `streaming`, `signed`, `skills` as
-  `Skill`s) instead of the SDK protobuf `AgentCard`; `RemoteCard.raw` keeps a copy of the
-  vetted protobuf.
+  `version`, `interface_url`, `protocol_version`, `streaming`, `has_signatures`,
+  `signature_verified`, `skills` as `Skill`s) instead of the SDK protobuf `AgentCard`;
+  `signature_verified` is `True` only when the policy required a signature and it
+  verified. `RemoteCard.raw` keeps a copy of the vetted protobuf.

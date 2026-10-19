@@ -114,6 +114,10 @@ class RemoteCard:
     ``interface_url``/``protocol_version`` are those of the ONE interface the client will
     use. Every text field was written by the remote: treat it as untrusted. ``raw`` is a
     copy of the vetted SDK ``AgentCard`` (protobuf) for anything not surfaced here.
+
+    ``has_signatures`` only says the card CARRIES signatures (anyone can attach one).
+    ``signature_verified`` is ``True`` only when the policy required a signature and it
+    verified against a pinned key; trust that one.
     """
 
     name: str
@@ -122,12 +126,13 @@ class RemoteCard:
     interface_url: str
     protocol_version: str
     streaming: bool
-    signed: bool
+    has_signatures: bool
+    signature_verified: bool
     skills: tuple[Skill, ...] = ()
     raw: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
-    def from_proto(cls, card: AgentCard) -> RemoteCard:
+    def from_proto(cls, card: AgentCard, *, signature_verified: bool = False) -> RemoteCard:
         raw = AgentCard()
         raw.CopyFrom(card)
         interface = card.supported_interfaces[0] if card.supported_interfaces else None
@@ -138,7 +143,8 @@ class RemoteCard:
             interface_url=interface.url if interface else "",
             protocol_version=interface.protocol_version if interface else "",
             streaming=bool(card.capabilities.streaming),
-            signed=bool(card.signatures),
+            has_signatures=bool(card.signatures),
+            signature_verified=signature_verified,
             skills=tuple(Skill.from_proto(s) for s in card.skills),
             raw=raw,
         )
