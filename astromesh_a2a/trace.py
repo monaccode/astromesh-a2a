@@ -8,28 +8,63 @@ import re
 import time
 from typing import Any
 
-_SECRET = re.compile(
-    r"authorization|api[-_]?key|token|secret|password|cookie|session", re.IGNORECASE
+_SECRET_KEYS = frozenset(
+    {
+        "authorization",
+        "proxy_authorization",
+        "x_api_key",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "client_secret",
+        "secret",
+        "password",
+        "passwd",
+        "token",
+        "bearer",
+        "cookie",
+        "set_cookie",
+        "session_token",
+        "session_key",
+        "session_cookie",
+    }
 )
+_SECRET_SUFFIXES = ("_token", "_secret", "_password", "_passwd", "_api_key", "_apikey")
+# Extra names that are secret only as URL query parameters.
+_QUERY_KEYS = frozenset({"key", "sig", "signature"})
+
+
+def _is_secret_key(name: str, *, query: bool = False) -> bool:
+    n = name.strip().lower().replace("-", "_")
+    if n in _SECRET_KEYS or (query and n in _QUERY_KEYS):
+        return True
+    return n.endswith(_SECRET_SUFFIXES)
+
+
 REDACTED = "[redacted]"
 _USERINFO = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s?#]*@")
-_QUERY = re.compile(
-    r"([?&;](?:token|access_token|api_key|key|sig|signature|password|secret)=)[^&#\s]*",
-    re.IGNORECASE,
-)
+_QUERY = re.compile(r"([?&;])([\w.-]+)=([^&#\s]*)")
 _SCHEME = re.compile(r"\b(Bearer|Basic)\s+[^\s,;]+", re.IGNORECASE)
+
+
+def _query_sub(m: re.Match[str]) -> str:
+    if _is_secret_key(m.group(2), query=True):
+        return f"{m.group(1)}{m.group(2)}={REDACTED}"
+    return m.group(0)
 
 
 def _redact_str(s: str) -> str:
     s = _USERINFO.sub(r"\1[redacted]@", s)
-    s = _QUERY.sub(r"\1[redacted]", s)
+    s = _QUERY.sub(_query_sub, s)
     return _SCHEME.sub(r"\1 [redacted]", s)
 
 
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            k: REDACTED if isinstance(k, str) and _SECRET.search(k) else _redact(v)
+            k: REDACTED if isinstance(k, str) and _is_secret_key(k) else _redact(v)
             for k, v in value.items()
         }
     if isinstance(value, (list, tuple)):

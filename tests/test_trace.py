@@ -44,7 +44,7 @@ def test_redaccion_de_valores_y_claves_extra():
     t = Trace()
     t.add(
         "x",
-        headers={"Cookie": "s=1", "Set-Cookie": "s=2", "session": "s3"},
+        headers={"Cookie": "s=1", "Set-Cookie": "s=2", "session_token": "s3"},
         url="https://u:p@h.com/p?token=abc&ok=1&API_KEY=k2&sig=z",
         note=["Authorization: Bearer abc123", "Basic dXNlcjpwdw=="],
     )
@@ -76,3 +76,49 @@ def test_add_copia_profunda_y_fallback_repr():
     d = t.to_dict()[0]
     assert d["data"] == {"a": [1]}
     assert isinstance(d["lock"], str)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "authorization", "Proxy-Authorization", "x-api-key", "X-API-Key", "api_key", "apikey",
+        "access_token", "refresh_token", "id_token", "client_secret", "secret", "password",
+        "passwd", "token", "bearer", "cookie", "Set-Cookie", "session_token", "session_key",
+        "session_cookie", "db_password", "github_token", "stripe_api_key",
+    ],
+)  # fmt: skip
+def test_claves_secretas_redactadas(key):
+    assert Trace_dict(key) == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "session_id", "sessions", "context_id", "task_id", "token_count", "tokens_in",
+        "tokens_out", "input_tokens", "output_tokens", "prompt_tokens", "completion_tokens",
+        "total_tokens", "max_tokens", "cookie_count",
+    ],
+)  # fmt: skip
+def test_claves_de_uso_e_ids_visibles(key):
+    assert Trace_dict(key) == "v"
+
+
+def Trace_dict(key):  # noqa: N802
+    t = Trace()
+    t.add("x", data={key: "v"})
+    return t.to_dict()[0]["data"][key]
+
+
+def test_query_con_prefijos():
+    t = Trace()
+    t.add("x", url="https://h.com/p?x=1&client_secret=abc&refresh_token=zz&id_token=q&sort_key=a")
+    t.add("y", url="https://h.com/p?apikey=1&x-api-key=2&keyword=k&access_token=3&api_key=4")
+    a, b = (e["url"] for e in t.to_dict())
+    assert a == (
+        "https://h.com/p?x=1&client_secret=[redacted]&refresh_token=[redacted]"
+        "&id_token=[redacted]&sort_key=a"
+    )
+    assert b == (
+        "https://h.com/p?apikey=[redacted]&x-api-key=[redacted]&keyword=k"
+        "&access_token=[redacted]&api_key=[redacted]"
+    )
