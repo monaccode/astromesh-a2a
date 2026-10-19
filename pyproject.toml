@@ -35,6 +35,7 @@ agent-framework = ["agent-framework>=1.19"]
 mcp = ["mcp>=1.28"]
 server = ["a2a-sdk[http-server]>=1.2,<2", "starlette>=0.40", "uvicorn>=0.30"]
 otel = ["opentelemetry-api>=1.33"]
+signing = ["PyJWT>=2.8"]
 all = [
   "langchain-core>=1.6",
   "crewai>=1.15",
@@ -49,6 +50,7 @@ all = [
   "starlette>=0.40",
   "uvicorn>=0.30",
   "opentelemetry-api>=1.33",
+  "PyJWT>=2.8",
 ]
 
 [project.urls]
@@ -56,7 +58,16 @@ Homepage = "https://github.com/monaccode/astromesh-a2a"
 Issues = "https://github.com/monaccode/astromesh-a2a/issues"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.16", "respx>=0.21"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.16",
+  "respx>=0.21",
+  # In-process SDK reference server for client tests, and card-signature tests.
+  "a2a-sdk[http-server]>=1.2,<2",
+  "uvicorn>=0.30",
+  "PyJWT>=2.8",
+]
 
 [build-system]
 requires = ["hatchling"]

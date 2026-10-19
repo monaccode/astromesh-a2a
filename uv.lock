@@ -912,6 +912,7 @@ all = [
     { name = "openai-agents" },
     { name = "opentelemetry-api" },
     { name = "pydantic-ai-slim", marker = "python_full_version >= '3.11'" },
+    { name = "pyjwt" },
     { name = "smolagents" },
     { name = "starlette" },
     { name = "uvicorn" },
@@ -942,16 +943,22 @@ server = [
     { name = "starlette" },
     { name = "uvicorn" },
 ]
+signing = [
+    { name = "pyjwt" },
+]
 smolagents = [
     { name = "smolagents" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "a2a-sdk", extra = ["http-server"] },
+    { name = "pyjwt" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "respx" },
     { name = "ruff" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -978,6 +985,8 @@ requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.33" },
     { name = "pydantic-ai-slim", marker = "python_full_version >= '3.11' and extra == 'all'", specifier = ">=2.55" },
     { name = "pydantic-ai-slim", marker = "python_full_version >= '3.11' and extra == 'pydantic-ai'", specifier = ">=2.55" },
+    { name = "pyjwt", marker = "extra == 'all'", specifier = ">=2.8" },
+    { name = "pyjwt", marker = "extra == 'signing'", specifier = ">=2.8" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "smolagents", marker = "extra == 'all'", specifier = ">=1.26" },
     { name = "smolagents", marker = "extra == 'smolagents'", specifier = ">=1.26" },
@@ -986,14 +995,17 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'all'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },
 ]
-provides-extras = ["langchain", "crewai", "adk", "openai-agents", "pydantic-ai", "llamaindex", "smolagents", "agent-framework", "mcp", "server", "otel", "all"]
+provides-extras = ["langchain", "crewai", "adk", "openai-agents", "pydantic-ai", "llamaindex", "smolagents", "agent-framework", "mcp", "server", "otel", "signing", "all"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.2,<2" },
+    { name = "pyjwt", specifier = ">=2.8" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "respx", specifier = ">=0.21" },
     { name = "ruff", specifier = ">=0.16" },
+    { name = "uvicorn", specifier = ">=0.30" },
 ]
 
 [[package]]

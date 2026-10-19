@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -28,6 +30,11 @@ class Policy:
     URL's hostname exactly, case-insensitively: no subdomain or suffix matching, the port
     is ignored, and a trailing dot ("a.com.") is a different host. URL entries must match
     the whole URL exactly (case-sensitive).
+
+    Card signatures (``require_signature=True``) are verified against ``signing_keys``,
+    a map ``kid -> key`` (PEM/secret str or bytes, or a ``jwt.PyJWK``), with only the
+    ``signing_algorithms`` listed. Keys are pinned by ``kid``: a ``jku`` URL in the
+    (untrusted) card header is never fetched. Needs the ``signing`` extra (PyJWT).
     """
 
     allowed: tuple[str, ...] = ()
@@ -38,6 +45,8 @@ class Policy:
     max_events: int = 1000
     budget: Budget | None = None
     allow_insecure_http: bool = False
+    signing_keys: Mapping[str, Any] = field(default_factory=dict, hash=False, repr=False)
+    signing_algorithms: tuple[str, ...] = ("ES256", "ES384", "RS256", "PS256", "EdDSA")
 
     def __post_init__(self) -> None:
         if isinstance(self.allowed, str):
@@ -46,6 +55,10 @@ class Policy:
             raise TypeError("Policy.accept_parts must be a collection of kinds, not a bare str")
         object.__setattr__(self, "allowed", tuple(self.allowed))
         object.__setattr__(self, "accept_parts", frozenset(self.accept_parts))
+        if isinstance(self.signing_algorithms, str):
+            raise TypeError("Policy.signing_algorithms must be a sequence, not a bare str")
+        object.__setattr__(self, "signing_algorithms", tuple(self.signing_algorithms))
+        object.__setattr__(self, "signing_keys", MappingProxyType(dict(self.signing_keys)))
 
     def check_card_url(self, url: str) -> None:
         """Raise PolicyRejected unless ``url`` is https (or opted-in http) and allowed."""
