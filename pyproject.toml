@@ -1,0 +1,81 @@
+[project]
+name = "astromesh-a2a"
+version = "0.1.0"
+description = "Agent-to-Agent (A2A) for any agent framework: a safe client and server on the official A2A SDK, with egress guards, remote-agent policy, traces and an attack eval."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Juan Carlos Romero", email = "jc@fulfaro.dev" }]
+keywords = ["a2a","agent2agent","agents","multi-agent","llm","langchain","crewai","google-adk","mcp","interoperability"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+dependencies = ["a2a-sdk>=1.2,<2", "httpx>=0.27", "pyyaml>=6.0"]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=1.6"]
+crewai = ["crewai>=1.15"]
+adk = ["google-adk>=1.14"]
+openai-agents = ["openai-agents>=0.20"]
+pydantic-ai = ["pydantic-ai-slim>=2.55; python_version >= '3.11'"]
+llamaindex = ["llama-index-core>=0.14"]
+smolagents = ["smolagents>=1.26"]
+agent-framework = ["agent-framework>=1.19"]
+mcp = ["mcp>=1.28"]
+server = ["a2a-sdk[http-server]>=1.2,<2", "starlette>=0.40", "uvicorn>=0.30"]
+otel = ["opentelemetry-api>=1.27"]
+all = [
+  "langchain-core>=1.6",
+  "crewai>=1.15",
+  "google-adk>=1.14",
+  "openai-agents>=0.20",
+  "pydantic-ai-slim>=2.55; python_version >= '3.11'",
+  "llama-index-core>=0.14",
+  "smolagents>=1.26",
+  "agent-framework>=1.19",
+  "mcp>=1.28",
+  "a2a-sdk[http-server]>=1.2,<2",
+  "starlette>=0.40",
+  "uvicorn>=0.30",
+  "opentelemetry-api>=1.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/monaccode/astromesh-a2a"
+Issues = "https://github.com/monaccode/astromesh-a2a/issues"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.16", "respx>=0.21"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["astromesh_a2a", "tests", "examples", "docs", "README*.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
+exclude = ["uv.lock", ".superpowers", ".github"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["astromesh_a2a"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["F", "E4", "E7", "E9", "W", "I", "UP", "B", "C4", "SIM", "RET", "PERF", "PIE", "DTZ", "LOG", "G", "PT", "N", "PTH", "RUF", "BLE", "PLE", "PLW"]
