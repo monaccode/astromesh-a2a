@@ -85,6 +85,7 @@ def test_add_copia_profunda_y_fallback_repr():
         "access_token", "refresh_token", "id_token", "client_secret", "secret", "password",
         "passwd", "token", "bearer", "cookie", "Set-Cookie", "session_token", "session_key",
         "session_cookie", "db_password", "github_token", "stripe_api_key",
+        "stripe_secret_key", "aws_secret_access_key", "AWS-Secret-Access-Key", "ssh_private_key",
     ],
 )  # fmt: skip
 def test_claves_secretas_redactadas(key):
@@ -122,3 +123,21 @@ def test_query_con_prefijos():
         "https://h.com/p?apikey=[redacted]&x-api-key=[redacted]&keyword=k"
         "&access_token=[redacted]&api_key=[redacted]"
     )
+
+
+def test_query_url_prefirmada():
+    t = Trace()
+    t.add(
+        "x",
+        url="https://s3.example.com/o?X-Amz-Credential=AKIA%2F1&X-Amz-Signature=abc"
+        "&X-Amz-Expires=60&credential=c&goog_signature=g",
+    )
+    assert t.to_dict()[0]["url"] == (
+        "https://s3.example.com/o?X-Amz-Credential=[redacted]&X-Amz-Signature=[redacted]"
+        "&X-Amz-Expires=60&credential=[redacted]&goog_signature=[redacted]"
+    )
+
+
+@pytest.mark.parametrize("key", ["private_key_id", "secret_keys_count", "public_key"])
+def test_sufijos_nuevos_no_tapan_vecinos(key):
+    assert Trace_dict(key) == "v"

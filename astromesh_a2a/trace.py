@@ -31,14 +31,26 @@ _SECRET_KEYS = frozenset(
         "session_cookie",
     }
 )
-_SECRET_SUFFIXES = ("_token", "_secret", "_password", "_passwd", "_api_key", "_apikey")
-# Extra names that are secret only as URL query parameters.
-_QUERY_KEYS = frozenset({"key", "sig", "signature"})
+_SECRET_SUFFIXES = (
+    "_token",
+    "_secret",
+    "_password",
+    "_passwd",
+    "_api_key",
+    "_apikey",
+    "_secret_key",
+    "_secret_access_key",
+    "_private_key",
+)
+# Extra names that are secret only as URL query parameters (presigned URLs carry
+# X-Amz-Signature / X-Amz-Credential and similar).
+_QUERY_KEYS = frozenset({"key", "sig", "signature", "credential"})
+_QUERY_SUFFIXES = ("_signature", "_credential")
 
 
 def _is_secret_key(name: str, *, query: bool = False) -> bool:
     n = name.strip().lower().replace("-", "_")
-    if n in _SECRET_KEYS or (query and n in _QUERY_KEYS):
+    if n in _SECRET_KEYS or (query and (n in _QUERY_KEYS or n.endswith(_QUERY_SUFFIXES))):
         return True
     return n.endswith(_SECRET_SUFFIXES)
 
