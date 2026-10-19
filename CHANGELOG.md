@@ -70,9 +70,14 @@
   `<remote-agent-output untrusted="true" ...>` with `<`/`>`/`&` escaped, and for a
   pending task its `task_id` plus a note that only the user may answer it. Errors use
   each framework's tool-error convention with a safe message. Name and description
-  default to the cached card (the remote's description quoted as untrusted). Sync calls
-  run on one background event loop (`run_sync`); a sync call inside a running loop is
-  refused. CI gains an `adapters` job with every extra installed.
+  default to the cached card (the remote's description quoted as untrusted). A
+  `RemoteAgent` is bound to the event loop of its first I/O and refuses others; sync
+  calls (`run_sync`) are dispatched to that loop when it runs in another thread, run on
+  a background loop when the agent has none yet, and raise a clear `RuntimeError` when
+  it is closed; a sync call inside a running loop is refused. Calls on one tool are
+  serialized; `RemoteTool.last_result` keeps the last `Result`. PydanticAI retries
+  (`ModelRetry`) only on `A2ATimeout`; other errors are returned as the tool result.
+  CI gains an `adapters` job with every extra installed.
 - Adapters for LlamaIndex (`FunctionTool`, sync + async), smolagents (`Tool`), Microsoft
   Agent Framework (`FunctionTool`) and MCP (a FastMCP `Tool`; `adapters.mcp.build_server`
   serves it as a whole MCP server, failures as `isError` results).
@@ -83,6 +88,10 @@
   `{"output": ...}` results become the answer, other dicts become `data`.
 
 ### Changed
+
+- `RemoteAgent`: only network/remote failures (SDK errors, httpx, OS, protobuf/JSON
+  decoding) are translated to our errors; a local exception (e.g. `RuntimeError`)
+  propagates unchanged instead of becoming `TaskFailed`.
 
 - **Breaking:** `RemoteAgent.card()` returns a frozen `RemoteCard` (`name`, `description`,
   `version`, `interface_url`, `protocol_version`, `streaming`, `has_signatures`,

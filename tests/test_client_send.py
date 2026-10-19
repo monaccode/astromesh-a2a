@@ -351,3 +351,14 @@ async def test_cerrado(server, loopback):
     await agent.aclose()  # idempotent
     with pytest.raises(RuntimeError):
         await agent.send("hello")
+
+
+async def test_local_error_is_not_translated(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+
+        async def boom(*_a, **_k):
+            raise RuntimeError("local bug")
+
+        agent._send_blocking = boom
+        with pytest.raises(RuntimeError, match="local bug"):
+            await agent.send("hi")

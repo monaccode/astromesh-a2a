@@ -1,11 +1,18 @@
+import asyncio
 import importlib
 import json
 
 import pytest
 from _fake import INJECTION, FakeAgent, asking, done
 
-from astromesh_a2a import TaskFailed
-from astromesh_a2a.adapters import MissingExtraError, RemoteTool, as_tool, run_sync
+from astromesh_a2a import A2ATimeout, TaskFailed
+from astromesh_a2a.adapters import (
+    MissingExtraError,
+    RemoteTool,
+    RemoteToolError,
+    as_tool,
+    run_sync,
+)
 from astromesh_a2a.adapters._common import (
     PENDING_NOTE,
     error_message,
@@ -138,3 +145,36 @@ def test_data_is_compact_json():
     out = wrap_untrusted(done("", data=[{"a": 1, "b": [1, 2]}]))
     line = next(x for x in out.splitlines() if x.startswith("[data] "))
     assert json.loads(line.removeprefix("[data] ")) == {"a": 1, "b": [1, 2]}
+
+
+class _SlowAgent(FakeAgent):
+    async def send(self, text, *, context_id=None):
+        await asyncio.sleep(0.01)  # yields: without the lock the 2nd call would also send
+        return await super().send(text, context_id=context_id)
+
+
+async def test_concurrent_calls_on_one_tool_are_serialized():
+    agent = _SlowAgent(asking(task_id="t-1"), done("ok"))
+    tool = RemoteTool.for_agent(agent, None, None)
+    first, second = await asyncio.gather(tool.acall("pay"), tool.acall("the user says yes"))
+    assert 'task_id="t-1"' in first
+    assert "ok" in second
+    assert agent.calls == [("send", "pay", None), ("reply", "t-1", "the user says yes")]
+    assert tool.last_result.answer == "ok"
+
+
+async def test_local_error_keeps_pending_and_propagates():
+    agent = FakeAgent(asking(task_id="t-1"), RuntimeError("bug here"), done("ok"))
+    tool = RemoteTool.for_agent(agent, None, None)
+    await tool.acall("pay")
+    assert tool.last_result.status == "input_required"
+    with pytest.raises(RuntimeError, match="bug here"):
+        await tool.acall("yes")
+    assert tool.pending_task_id == "t-1"
+    await tool.acall("yes")
+    assert agent.calls[-1] == ("reply", "t-1", "yes")
+
+
+def test_remote_tool_error_keeps_error_type():
+    err = RemoteToolError("m", A2ATimeout)
+    assert err.error_type is A2ATimeout

@@ -64,6 +64,8 @@ from a2a.types import (
 )
 from a2a.utils import errors as sdk_errors
 from a2a.utils.constants import TransportProtocol
+from google.protobuf import json_format as pb_json
+from google.protobuf import message as pb_message
 from google.protobuf.json_format import MessageToDict
 
 from astromesh_a2a.card import RemoteCard
@@ -99,6 +101,21 @@ _T = TypeVar("_T")
 
 class _ClosedError(RuntimeError):
     """The RemoteAgent was closed (passes through unchanged, never translated)."""
+
+
+LOOP_ERROR = "RemoteAgent is bound to another event loop; create one RemoteAgent per loop"
+
+# Failures that come from the network or the remote's bytes: translated to our errors.
+# Anything else (RuntimeError, TypeError, a bug...) is local and propagates unchanged.
+_REMOTE_FAILURES = (
+    sdk_errors.A2AError,
+    httpx.HTTPError,
+    OSError,
+    pb_json.Error,
+    pb_message.Error,
+    json.JSONDecodeError,
+    UnicodeDecodeError,
+)
 
 
 @dataclass
@@ -253,6 +270,7 @@ class RemoteAgent:
         self._contexts: OrderedDict[str, str] = OrderedDict()
         self._meter = BudgetMeter(policy.budget)
         self._closed = False
+        self._loop: asyncio.AbstractEventLoop | None = None  # recorded on first I/O
 
     def __repr__(self) -> str:
         return f"RemoteAgent({self.card_url!r}, origin={self.origin.value!r})"
@@ -277,6 +295,17 @@ class RemoteAgent:
         if self._closed:
             raise _ClosedError("RemoteAgent is closed")
 
+    def _bind_loop(self) -> None:
+        """Record the running loop on first I/O; refuse any other loop afterwards.
+
+        The httpx connections this agent pools belong to the loop that opened them.
+        """
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        elif self._loop is not loop:
+            raise RuntimeError(LOOP_ERROR)
+
     # ---- card -------------------------------------------------------------------
 
     async def card(self) -> RemoteCard:
@@ -286,6 +315,7 @@ class RemoteAgent:
         vetted SDK card. Its text was written by the remote: untrusted.
         """
         self._check_open()
+        self._bind_loop()
         try:
             async with _deadline(self.policy.timeout):
                 card = await self._vetted_card(Trace())
@@ -488,7 +518,9 @@ class RemoteAgent:
         return self.policy.timeout if left is None else min(self.policy.timeout, left)
 
     async def _guarded(self, run: Callable[[], Awaitable[_T]], trace: Trace) -> _T:
-        """Budget, deadline, vetted card, then ``run()``; failures become our errors."""
+        """Budget, deadline, vetted card, then ``run()``; remote failures become our errors
+        (local ones, e.g. a ``RuntimeError``, propagate unchanged)."""
+        self._bind_loop()
         self._meter.admit()
         limit = self._limit()
         started = time.monotonic()
@@ -503,7 +535,9 @@ class RemoteAgent:
                 raise A2ATimeout(f"remote call exceeded {limit:g}s") from None
             except (A2AError, _ClosedError):
                 raise
-            except Exception as exc:  # noqa: BLE001 - translated below, never passed through
+            except Exception as exc:
+                if not _is_remote_failure(exc):
+                    raise
                 failure = exc
             raise _translated(failure)  # outside the handler: no implicit __context__ cycle
         finally:
@@ -577,6 +611,7 @@ class RemoteAgent:
         self, text: str, context_id: str | None, trace: Trace
     ) -> AsyncIterator[Event]:
         self._check_open()
+        self._bind_loop()
         self._meter.admit()
         limit = self._limit()
         started = time.monotonic()
@@ -619,7 +654,9 @@ class RemoteAgent:
                 raise A2ATimeout(f"stream exceeded {limit:g}s") from None
             except (A2AError, _ClosedError):
                 raise
-            except Exception as exc:  # noqa: BLE001 - translated below, never passed through
+            except Exception as exc:
+                if not _is_remote_failure(exc):
+                    raise
                 failure = exc
             else:
                 return
@@ -903,6 +940,10 @@ def _chain(exc: BaseException) -> Iterator[BaseException]:
         seen.add(id(current))
         yield current
         current = current.__cause__ or current.__context__
+
+
+def _is_remote_failure(exc: BaseException) -> bool:
+    return any(isinstance(e, _REMOTE_FAILURES) for e in _chain(exc))
 
 
 def _translated(exc: BaseException) -> A2AError:

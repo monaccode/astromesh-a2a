@@ -43,6 +43,13 @@ def build_server(
     description: str | None = None,
     server_name: str = "astromesh-a2a",
 ) -> Any:
-    """A ``FastMCP`` server whose only tool is ``agent`` (see ``as_tool``)."""
+    """A ``FastMCP`` server whose only tool is ``agent`` (see ``as_tool``).
+
+    Run it over **stdio** (``server.run()``, the default): one local client, one
+    conversation. The HTTP transports (SSE / streamable HTTP) add NO authentication: if
+    you expose one, put it behind your own auth. Every MCP client of this server shares
+    the tool's single remote conversation (and its pending task) and calls the remote
+    with THIS process's credentials (``agent.auth``), so never serve it to several users.
+    """
     fastmcp = require("mcp.server.fastmcp", "mcp")
     return fastmcp.FastMCP(server_name, tools=[as_tool(agent, name=name, description=description)])

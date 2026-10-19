@@ -13,12 +13,20 @@ The tool contract is the same in every framework:
 - An ``A2AError`` becomes the framework's tool-error convention with a short message
   (class name + our message, escaped); no stack, no credentials.
 
-Sync frameworks (and the sync entry points of LangChain/LlamaIndex) go through
-``run_sync()``: one background event loop, shared by the whole process, runs every
-coroutine. A per-call ``asyncio.run()`` would not do: it closes its loop after each
-call, and the ``RemoteAgent``'s pooled httpx connections belong to the loop that opened
-them. Consequence: drive one ``RemoteAgent`` either from your own loop (async tools) or
-from sync tools, not both.
+Loop affinity. A ``RemoteAgent`` records the event loop of its first I/O (its pooled
+httpx connections belong to that loop) and refuses any other loop. Sync frameworks (and
+the sync entry points of LangChain/LlamaIndex) go through ``run_sync()``:
+
+- the agent's loop is running in another thread (e.g. your ``async`` main did
+  ``await agent.card()`` and a crew runs its tools in a worker thread): the call is
+  dispatched to THAT loop;
+- the agent has no loop yet: the call runs on the adapters' background loop (one per
+  process), which becomes the agent's loop;
+- the agent's loop is closed or not running (e.g. ``asyncio.run(agent.card())`` earlier):
+  ``RuntimeError``, create one ``RemoteAgent`` per loop. From plain sync code, load the
+  card with ``run_sync(agent.card())`` instead.
+
+A sync call from a thread whose own loop is running is refused (it would block it).
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ from collections.abc import Coroutine
 from types import ModuleType
 from typing import Any, TypeVar
 
+from astromesh_a2a.client import LOOP_ERROR
 from astromesh_a2a.errors import A2AError, TaskFailed
 from astromesh_a2a.types import Result
 
@@ -75,7 +84,14 @@ class MissingExtraError(ImportError):
 
 
 class RemoteToolError(A2AError):
-    """A remote call failed; its message is safe to show a model (see ``error_message``)."""
+    """A remote call failed; its message is safe to show a model (see ``error_message``).
+
+    ``error_type`` is the class of the ``A2AError`` behind it (e.g. ``A2ATimeout``).
+    """
+
+    def __init__(self, message: str, error_type: type[A2AError] = A2AError):
+        super().__init__(message)
+        self.error_type = error_type
 
 
 def require(module: str, extra: str) -> ModuleType:
@@ -178,11 +194,13 @@ def _bridge_loop() -> asyncio.AbstractEventLoop:
         return _bridge
 
 
-def run_sync(coro: Coroutine[Any, Any, _T]) -> _T:
-    """Run ``coro`` to completion from sync code, on the adapters' background loop.
+def run_sync(coro: Coroutine[Any, Any, _T], *, agent: Any = None) -> _T:
+    """Run ``coro`` to completion from sync code, on ``agent``'s loop (see module docs).
 
-    Raises ``RuntimeError`` when called from a thread whose event loop is running (it
-    would block that loop): use the tool's async API there, or call from a worker thread.
+    Without ``agent`` (or for an agent with no loop yet) it runs on the adapters'
+    background loop. Raises ``RuntimeError`` when called from a thread whose event loop
+    is running (it would block that loop), or when ``agent`` is bound to a loop that is
+    closed or not running.
     """
     try:
         asyncio.get_running_loop()
@@ -194,7 +212,13 @@ def run_sync(coro: Coroutine[Any, Any, _T]) -> _T:
             "astromesh-a2a: a sync tool call was made inside a running event loop; "
             "use the framework's async tool API, or call it from a worker thread"
         )
-    return asyncio.run_coroutine_threadsafe(coro, _bridge_loop()).result()
+    loop = getattr(agent, "_loop", None)
+    if loop is None:
+        loop = _bridge_loop()
+    elif loop.is_closed() or not loop.is_running():
+        coro.close()
+        raise RuntimeError(LOOP_ERROR)
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
 
 # ---- the tool -----------------------------------------------------------------------
@@ -214,6 +238,8 @@ class RemoteTool:
         self.agent_name = agent_name
         self.pending_task_id: str | None = None
         self.context_id: str | None = None
+        self.last_result: Result | None = None  # the last successful call's Result
+        self._lock: asyncio.Lock | None = None  # created on first call, in the agent's loop
 
     @classmethod
     def for_agent(cls, agent: Any, name: str | None, description: str | None) -> RemoteTool:
@@ -241,25 +267,34 @@ class RemoteTool:
         """Forget the pending task and the conversation (start a new one)."""
         self.pending_task_id = None
         self.context_id = None
+        self.last_result = None
 
     async def acall(self, query: str) -> str:
-        """Send (or reply with) ``query``; ``RemoteToolError`` on any ``A2AError``."""
+        """Send (or reply with) ``query``; ``RemoteToolError`` on any ``A2AError``.
+
+        Calls on one tool are serialized (a second call waits and sees the state the first
+        left). A local error (not an ``A2AError``) propagates and keeps the pending task.
+        """
         if not isinstance(query, str):
             raise TypeError("query must be a str")
-        try:
-            if self.pending_task_id is not None:
-                result = await self.agent.reply(self.pending_task_id, query)
-            else:
-                result = await self.agent.send(query, context_id=self.context_id)
-        except A2AError as exc:
-            if isinstance(exc, TaskFailed):
-                self.pending_task_id = None  # the task is over; next call starts a new one
-            raise RemoteToolError(error_message(exc)) from None
-        self.context_id = result.context_id or self.context_id
-        pending = result.status in PENDING_STATUSES and result.task_id
-        self.pending_task_id = result.task_id if pending else None
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            try:
+                if self.pending_task_id is not None:
+                    result = await self.agent.reply(self.pending_task_id, query)
+                else:
+                    result = await self.agent.send(query, context_id=self.context_id)
+            except A2AError as exc:
+                if isinstance(exc, TaskFailed):
+                    self.pending_task_id = None  # the task is over; next call starts anew
+                raise RemoteToolError(error_message(exc), type(exc)) from None
+            self.last_result = result
+            self.context_id = result.context_id or self.context_id
+            pending = result.status in PENDING_STATUSES and result.task_id
+            self.pending_task_id = result.task_id if pending else None
         return wrap_untrusted(result, agent=self.agent_name)
 
     def call(self, query: str) -> str:
-        """``acall`` from sync code, through ``run_sync``."""
-        return run_sync(self.acall(query))
+        """``acall`` from sync code, through ``run_sync`` on the agent's loop."""
+        return run_sync(self.acall(query), agent=self.agent)
