@@ -13,7 +13,7 @@ What the app does around the SDK (ADR 0001 §2, §6):
   ``auth`` may return a ``str``: that is the caller's identity, and tasks are scoped per
   identity (``True`` means one shared identity, ``"authenticated"``).
 - **Body cap:** a request body over ``max_body_bytes`` answers ``413`` (the SDK reads
-  bodies unbounded).
+  bodies unbounded); a malformed ``Content-Length`` answers ``400``.
 - **Version:** handled by the SDK. Only ``A2A-Version: 1.x`` is served; a missing header
   means 0.3 and is refused, like any other version, with JSON-RPC ``-32009``
   (VersionNotSupported). The v0.3 compat layer stays off.
@@ -269,7 +269,11 @@ class _Guard:
         if public:
             await self.app(scope, receive, send)
             return
-        body = await self._read_body(scope, receive)
+        try:
+            body = await self._read_body(scope, receive)
+        except ValueError:
+            await _send_json(send, 400, {"error": "invalid content-length"})
+            return
         if body is None:
             await _send_json(send, 413, {"error": "request body too large"})
             return
@@ -289,13 +293,15 @@ class _Guard:
         return None
 
     async def _read_body(self, scope: dict, receive: Any) -> bytes | None:
-        """The whole body, or None past ``max_body_bytes`` (checked as it streams in)."""
+        """The whole body, or None past ``max_body_bytes`` (checked as it streams in).
+
+        ``ValueError`` for a malformed ``Content-Length`` (answered ``400``).
+        """
         for name, value in scope.get("headers", []):
             if name == b"content-length":
-                try:
-                    if int(value) > self.max_body_bytes:
-                        return None
-                except ValueError:
+                if not value.isdigit():  # also refuses "-1", "+5", " 5", "1_0"
+                    raise ValueError("invalid content-length")
+                if int(value) > self.max_body_bytes:
                     return None
         chunks: list[bytes] = []
         size = 0
@@ -363,7 +369,12 @@ def create_app(
     ``handler_timeout`` (seconds, ``None`` = no limit) caps each handler call; past it the
     task fails with the generic message. ``task_store`` defaults to the SDK's
     ``InMemoryTaskStore``: lost on restart and unbounded (it keeps every task), fine for
-    development; pass a persistent/bounded ``TaskStore`` in production.
+    development; pass a persistent/bounded ``TaskStore`` in production. Tasks are scoped
+    by owner (the identity ``auth`` returned): one caller cannot get, cancel or reply to
+    another's task. A custom ``task_store`` MUST keep that scoping: resolve the owner
+    from the ``ServerCallContext`` the SDK passes to every ``save``/``get``/``list``/
+    ``delete`` and filter by it, as the SDK stores do (``owner_resolver``, default
+    ``resolve_user_scope``).
 
     Mountable under a sub-path: then ``card.url`` must include that path. The app's
     lifespan closes the SDK request handler on shutdown; a mounted sub-app's lifespan does

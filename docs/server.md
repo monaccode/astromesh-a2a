@@ -128,14 +128,21 @@ the SDK request handler on shutdown; a host app that needs that cleanup has to d
 |---|---|---|
 | `auth` | required | see above |
 | `insecure` | `False` | serve without auth (local only) |
-| `max_body_bytes` | 1 MiB | a larger request body answers `413` (the SDK reads bodies unbounded) |
+| `max_body_bytes` | 1 MiB | a larger request body answers `413` (the SDK reads bodies unbounded); a malformed `Content-Length` answers `400` |
 | `handler_timeout` | 300 s | `None` for no limit; past it the task fails |
-| `task_store` | SDK `InMemoryTaskStore` | lost on restart and unbounded: pass a persistent or bounded `TaskStore` in production |
+| `task_store` | SDK `InMemoryTaskStore` | lost on restart and unbounded: pass a persistent or bounded `TaskStore` in production. It **must scope tasks by owner** (see below) |
 
 Only `A2A-Version: 1.x` is served; a request without the header means 0.3 and is refused
 with JSON-RPC `-32009`.
 
 ## Sessions
+
+Tasks are scoped by owner, the identity your `auth` returned: one caller cannot get,
+cancel or reply to another caller's task, even knowing its id. That scoping lives in the
+task store. A custom `task_store` must keep it: resolve the owner from the
+`ServerCallContext` the SDK passes to every `save`/`get`/`list`/`delete` and filter by it,
+as the SDK's stores do (`owner_resolver`, default `resolve_user_scope`). With
+`insecure=True` every caller is the same owner and shares every task.
 
 `context_id` is chosen by the caller and is not scoped: two callers can send the same one.
 Key memory and session state by `msg.session_key`, never by `context_id` alone.

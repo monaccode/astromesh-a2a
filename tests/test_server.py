@@ -466,6 +466,55 @@ async def test_session_key_separa_identidades():
     assert len(set(keys)) == 3
 
 
+async def test_content_length_invalido_es_400(key_env):
+    recorder = Recorder()
+    app = create_app(recorder, _card(), auth=api_key_auth(ENV), max_body_bytes=2048)
+    body = httpx.Request("POST", "http://t", json=_rpc("x")).read()
+    async with _asgi(app) as hx:
+        for bad in ("abc", "-1", "1e3", ""):
+            headers = {**HEADERS, "Content-Type": "application/json", "Content-Length": bad}
+            r = await hx.post("/a2a", content=body, headers=headers)
+            assert r.status_code == 400, bad
+            assert r.json() == {"error": "invalid content-length"}
+    assert recorder.seen == []
+
+
+async def test_otro_caller_no_ve_ni_cancela_la_tarea_ajena():
+    async def auth(request):
+        return request.headers.get("x-who") or False
+
+    recorder = Recorder()
+    app = create_app(recorder, _card(), auth=auth)
+
+    def call(method: str, params: dict) -> dict:
+        return {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+
+    def as_(who: str) -> dict:
+        return {"x-who": who, "A2A-Version": "1.0"}
+
+    async with _asgi(app) as hx:
+        r = await hx.post("/a2a", json=_rpc("transfer"), headers=as_("alice"))
+        task = r.json()["result"]["task"]
+        assert task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"  # still alive
+        get = call("GetTask", {"id": task["id"]})
+        cancel = call("CancelTask", {"id": task["id"]})
+        bob_get = (await hx.post("/a2a", json=get, headers=as_("bob"))).json()
+        bob_cancel = (await hx.post("/a2a", json=cancel, headers=as_("bob"))).json()
+        reply = {"messageId": "m2", "role": "ROLE_USER", "parts": [{"text": "yes"}]}
+        reply["taskId"] = task["id"]
+        bob_reply = (await hx.post("/a2a", json=_rpc(message=reply), headers=as_("bob"))).json()
+        alice_get = (await hx.post("/a2a", json=get, headers=as_("alice"))).json()
+    assert "error" in bob_get
+    assert "result" not in bob_get
+    assert "error" in bob_cancel
+    assert "result" not in bob_cancel
+    assert "error" in bob_reply
+    assert "result" not in bob_reply
+    assert [i.caller for i in recorder.seen] == ["alice"]  # Bob's reply never ran
+    # Bob's cancel did nothing: Alice still sees her task waiting for input.
+    assert alice_get["result"]["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+
+
 async def test_session_key_insecure_sin_identidad():
     recorder = Recorder()
     app = create_app(recorder, _card(), auth=None, insecure=True)
