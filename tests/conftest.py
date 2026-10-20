@@ -18,10 +18,11 @@ the client really closed a stream (an abandoned, half-read stream keeps its conn
 can assert what left the client — and what did not.
 
 Loopback is blocked by the egress guard, so tests that talk to this server use the
-``loopback`` fixture: it swaps ``astromesh_a2a.client._http_client`` for one built with
-``net.safe_client(..., allow_private=True)``. That keeps the real ``PinnedTransport``
-(size cap, no redirects, one host per client) and only lifts the public-address rule.
-It exists ONLY here; the library has no public flag that turns it on.
+``loopback`` fixture: it applies ``astromesh_a2a.testing.allow_loopback`` to every
+``RemoteAgent`` the test builds, whose clients are then ``net.safe_client(...,
+allow_private=True)``. That keeps the real ``PinnedTransport`` (size cap, no redirects,
+one host per client) and only lifts the public-address rule. ``Policy`` has no flag
+that turns it on.
 """
 
 from __future__ import annotations
@@ -263,16 +264,14 @@ def server(ref_server):
 
 @pytest.fixture
 def loopback(monkeypatch):
-    """Let RemoteAgent reach 127.0.0.1/localhost (tests only; see module docstring)."""
-    from astromesh_a2a import client, net
+    """Every RemoteAgent built in this test may reach 127.0.0.1/localhost (see module doc)."""
+    from astromesh_a2a.client import RemoteAgent
+    from astromesh_a2a.testing import allow_loopback
 
-    def _test_client(policy, headers):
-        return net.safe_client(
-            timeout=policy.timeout,
-            max_bytes=policy.max_bytes,
-            max_stream_bytes=policy.max_stream_bytes,
-            allow_private=True,
-            headers=headers,
-        )
+    original = RemoteAgent.__init__
 
-    monkeypatch.setattr(client, "_http_client", _test_client)
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        allow_loopback(self)
+
+    monkeypatch.setattr(RemoteAgent, "__init__", init)

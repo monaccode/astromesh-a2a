@@ -2,17 +2,19 @@
 
     uv run python examples/hello_local.py
 
-Needs the ``server`` extra (``pip install 'astromesh-a2a[server]'``). It starts
+Run it from a checkout of the repository (it is not shipped in the wheel), with the
+``server`` extra installed (``pip install 'astromesh-a2a[server]'``). It starts
 ``create_app`` under uvicorn on ``127.0.0.1`` (in a thread), protected by an API key,
 then talks to it with ``RemoteAgent``: card, ``send()``, a confirmation that the client
 does NOT answer on its own, ``reply()`` and ``stream()``.
 
 LOOPBACK OPT-IN (this example only). The egress guard refuses private and loopback
 addresses, so a ``RemoteAgent`` cannot reach ``127.0.0.1`` by default. Like the tests
-and the eval, this script hands ITS agent a guarded client with only the
-public-address rule lifted (``net.safe_client(..., allow_private=True)``). That is a
-private attribute set on one instance; there is no public flag for it, on purpose.
-Real remotes are public hosts listed in ``Policy.allowed``: drop ``_loopback()``.
+and the eval, this script calls ``astromesh_a2a.testing.allow_loopback(agent)`` on ITS
+agent: only the public-address rule is lifted, for that one instance. It is for local
+development and tests only, never production; ``Policy`` has no flag for it, on
+purpose. Real remotes are public hosts listed in ``Policy.allowed``: drop
+``allow_loopback()``.
 """
 
 from __future__ import annotations
@@ -34,9 +36,8 @@ from astromesh_a2a import (
     Skill,
     api_key_auth,
     create_app,
-    net,
 )
-from astromesh_a2a.client import A2A_VERSION
+from astromesh_a2a.testing import allow_loopback
 
 KEY_ENV = "HELLO_A2A_KEY"
 
@@ -72,23 +73,13 @@ def start_server(port: int) -> tuple[object, threading.Thread]:
     return server, thread
 
 
-def _loopback(agent: RemoteAgent) -> RemoteAgent:
-    """Example-only opt-in to reach 127.0.0.1 (see the module docstring)."""
-    agent._card_http = net.safe_client(
-        timeout=agent.policy.timeout,
-        max_bytes=agent.policy.max_bytes,
-        max_stream_bytes=agent.policy.max_stream_bytes,
-        allow_private=True,
-        headers={"A2A-Version": A2A_VERSION},
-    )
-    return agent
-
-
 def local_agent(port: int) -> RemoteAgent:
     """A client for the local server. Plain http only because it is local."""
     policy = Policy(allowed=("127.0.0.1",), allow_insecure_http=True, timeout=10.0)
     url = f"http://127.0.0.1:{port}"
-    return _loopback(RemoteAgent(url, policy=policy, auth=Auth.api_key(KEY_ENV)))
+    agent = RemoteAgent(url, policy=policy, auth=Auth.api_key(KEY_ENV))
+    allow_loopback(agent)  # local development only, never production (see above)
+    return agent
 
 
 async def main(port: int) -> None:

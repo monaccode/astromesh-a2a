@@ -55,7 +55,8 @@ class Event:
 
 @dataclass(frozen=True)
 class Auth:
-    """Credentials for the remote's RPC endpoint, read at call time.
+    """Credentials for the remote agent (sent on the card fetch and every RPC), read at
+    call time.
 
     The secret comes from an environment variable or a callable; it is never stored on
     this object, never put in a trace, repr or error message.

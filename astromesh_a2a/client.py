@@ -22,6 +22,11 @@ Flow of a call (ADR 0001 §1, §5):
 Confirmations are never answered here: ``send()`` returns ``input_required`` and
 ``stream()`` emits that status and ends. Only an explicit ``reply()`` continues the task.
 
+Credentials: ``auth`` headers go on the card fetch (the card URL is the one the caller
+configured, and the policy allowed it) and on every RPC (the interface URL passed the
+policy, or is on the card's own host). They never go anywhere else, and never into a
+trace, repr or error.
+
 HTTP clients: ``net.safe_client`` pins ONE host per client. The card client is reused for
 the RPC when the interface is on the same scheme/host/port; otherwise a second safe client
 is opened for the interface host. ``RemoteAgent`` owns both and closes them in
@@ -155,9 +160,14 @@ else:  # pragma: no cover - Python 3.10 fallback
             handle.cancel()
 
 
-def _http_client(policy: Policy, headers: dict[str, str]) -> httpx.AsyncClient:
-    """The egress-guarded client for one remote host. (Tests swap this for loopback.)"""
-    return policy.client(headers=headers)
+def _http_client(
+    policy: Policy, headers: dict[str, str], *, allow_private: bool = False
+) -> httpx.AsyncClient:
+    """The egress-guarded client for one remote host.
+
+    ``allow_private`` is only ever set by ``astromesh_a2a.testing.allow_loopback``.
+    """
+    return policy.client(headers=headers, allow_private=allow_private)
 
 
 def _origin_key(url: str) -> tuple[str, str, int | None]:
@@ -275,6 +285,7 @@ class RemoteAgent:
         self._meter = BudgetMeter(policy.budget)
         self._closed = False
         self._loop: asyncio.AbstractEventLoop | None = None  # recorded on first I/O
+        self._allow_private = False  # only astromesh_a2a.testing.allow_loopback sets it
 
     def __repr__(self) -> str:
         return f"RemoteAgent({self.card_url!r}, origin={self.origin.value!r})"
@@ -366,11 +377,14 @@ class RemoteAgent:
 
     async def _load_card(self, trace: Trace) -> AgentCard:
         if self._card_http is None:
-            self._card_http = _http_client(self.policy, {"A2A-Version": A2A_VERSION})
+            self._card_http = self._new_http()
+        headers = {"Accept": "application/json"}
+        if self.auth is not None:
+            # The card host is the one the caller configured and the policy allowed; some
+            # servers (e.g. Nexus) authenticate the card too. Never traced.
+            headers.update(self.auth.headers())
         try:
-            response = await self._card_http.get(
-                self._fetch_url, headers={"Accept": "application/json"}
-            )
+            response = await self._card_http.get(self._fetch_url, headers=headers)
         except httpx.TimeoutException:
             raise A2ATimeout("card fetch timed out") from None
         except httpx.HTTPError:
@@ -416,6 +430,11 @@ class RemoteAgent:
             if not (exc.reason == "host_not_allowed" and same_host):
                 raise PolicyRejected(f"interface:{exc.reason}") from None
 
+    def _new_http(self) -> httpx.AsyncClient:
+        return _http_client(
+            self.policy, {"A2A-Version": A2A_VERSION}, allow_private=self._allow_private
+        )
+
     def _sdk_client(self, *, streaming: bool) -> Any:
         """SDK client over our pinned httpx client (one per streaming mode, reused)."""
         self._check_open()
@@ -426,7 +445,7 @@ class RemoteAgent:
                 if _origin_key(self._interface.url) == _origin_key(self._fetch_url):
                     self._rpc_http = self._card_http
                 else:
-                    self._rpc_http = _http_client(self.policy, {"A2A-Version": A2A_VERSION})
+                    self._rpc_http = self._new_http()
             config = ClientConfig(
                 httpx_client=self._rpc_http,
                 streaming=streaming,

@@ -122,8 +122,15 @@ Auth.from_callable(lambda: "Bearer " + "token-from-your-refresher")  # called pe
 
 The secret is read at call time from the environment variable or the callable. It is never
 stored on the object, and never appears in a trace, a `repr` or an error message. A missing
-secret raises `PolicyRejected("auth")` before anything is sent. Credentials go to the RPC
-interface the card names (on the card's host or another allowed host).
+secret raises `PolicyRejected("auth")` before anything is sent, card fetch included.
+
+Credentials go only to allowed hosts: to the card fetch (the card URL is the one you
+configured, and the policy allowed it; some servers, such as Astromesh Nexus, authenticate
+the card too) and to the RPC interface the card names (on the card's host or another
+allowed host). A card whose interface is on a host the policy does not allow is refused
+before any RPC, so the credentials never leave for it. See
+[policy.md](policy.md#credentials-and-the-interface-host) for the same-host, other-port
+case.
 
 ## Origin and tracing
 

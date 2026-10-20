@@ -8,12 +8,13 @@ needs no server at all: its resolver is injected and its inner transport only co
 
 Loopback opt-in. The egress guard blocks ``127.0.0.1``, so a ``RemoteAgent`` could never
 reach these servers. Exactly as the test-suite does (``tests/conftest.py``), the eval
-lifts ONLY the public-address rule for its own agents: each trap agent gets an HTTP
-client built with ``net.safe_client(..., allow_private=True)`` (same ``PinnedTransport``:
-body caps, no redirects, one host per client). It is set on that one agent instance
-(never a module-wide patch), so no other ``RemoteAgent`` in the process is affected. A
-second origin (an interface on another host) still gets the library's normal, guarded
-client. The library has no public flag that does this.
+lifts ONLY the public-address rule for its own agents, with
+``astromesh_a2a.testing.allow_loopback(agent)``: its HTTP clients are built with
+``net.safe_client(..., allow_private=True)`` (same ``PinnedTransport``: body caps, no
+redirects, one host per client). It is set on that one agent instance (never a
+module-wide patch), so no other ``RemoteAgent`` in the process is affected; the
+policy's host checks (card and interface) still apply. ``Policy`` has no flag that
+does this.
 
 Policy. Each trap runs with the caller's policy, except that the trap's own host is
 added to ``allowed`` and plain ``http`` is allowed (the servers are local): the premise
@@ -36,7 +37,7 @@ from typing import Any
 import httpx
 
 from astromesh_a2a import net
-from astromesh_a2a.client import A2A_VERSION, RemoteAgent
+from astromesh_a2a.client import RemoteAgent
 from astromesh_a2a.errors import (
     A2AError,
     A2ATimeout,
@@ -45,6 +46,7 @@ from astromesh_a2a.errors import (
     UnsupportedVersion,
 )
 from astromesh_a2a.policy import Policy
+from astromesh_a2a.testing import allow_loopback
 
 # What the traps send.
 FILE_PART = b"\x89PNG\r\n\x1a\n"
@@ -348,20 +350,9 @@ def _policy_for(policy: Policy, *hosts: str) -> Policy:
     return replace(policy, allowed=(*policy.allowed, *hosts), allow_insecure_http=True)
 
 
-def _loopback_client(policy: Policy) -> httpx.AsyncClient:
-    """The eval's opt-in: the guarded client with only the public-address rule lifted."""
-    return net.safe_client(
-        timeout=policy.timeout,
-        max_bytes=policy.max_bytes,
-        max_stream_bytes=policy.max_stream_bytes,
-        allow_private=True,
-        headers={"A2A-Version": A2A_VERSION},
-    )
-
-
 def _local_agent(url: str, policy: Policy) -> RemoteAgent:
     agent = RemoteAgent(url, policy=_policy_for(policy, "127.0.0.1"))
-    agent._card_http = _loopback_client(agent.policy)  # this agent only; see module doc
+    allow_loopback(agent)  # this agent only; see module doc
     return agent
 
 

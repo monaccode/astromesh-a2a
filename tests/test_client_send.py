@@ -283,9 +283,37 @@ async def test_auth_api_key_desde_env(server, loopback, monkeypatch):
     assert rpc["x-api-key"] == API_KEY
     assert API_KEY not in str(result.trace)
     assert API_KEY not in repr(result)
-    # Credentials go to the RPC endpoint, not to the card fetch.
+    assert API_KEY not in repr(agent)
+    # The card fetch carries the credentials too (servers like Nexus authenticate it).
     card_get = next(r for r in server.requests if r["method"] == "GET")
-    assert "x-api-key" not in card_get["headers"]
+    assert card_get["headers"]["x-api-key"] == API_KEY
+
+
+async def test_card_con_auth_y_sin_secreto_no_se_pide(server, loopback, monkeypatch):
+    monkeypatch.setenv("ECHO_KEY", API_KEY)
+    async with RemoteAgent(server.base, policy=_policy(), auth=Auth.api_key("ECHO_KEY")) as a:
+        card = await a.card()
+    assert server.requests[0]["headers"]["x-api-key"] == API_KEY
+    assert API_KEY not in repr(card)
+
+    server.reset()
+    monkeypatch.delenv("ECHO_KEY")
+    async with RemoteAgent(server.base, policy=_policy(), auth=Auth.api_key("ECHO_KEY")) as a:
+        with pytest.raises(PolicyRejected) as exc:
+            await a.card()
+    assert exc.value.reason == "auth"
+    assert server.requests == []  # a missing secret sends nothing, not even the card GET
+
+
+async def test_credenciales_no_van_a_un_host_no_permitido(server, loopback, monkeypatch):
+    # The interface names another host the policy does not allow: refused before any RPC,
+    # so the credentials only ever reached the (allowed) card host.
+    monkeypatch.setenv("ECHO_KEY", API_KEY)
+    url = server.base + "/other-host/agent-card.json"
+    async with RemoteAgent(url, policy=_policy(), auth=Auth.api_key("ECHO_KEY")) as a:
+        with pytest.raises(PolicyRejected, match="interface"):
+            await a.send("hi")
+    assert [r["path"] for r in server.requests] == ["/other-host/agent-card.json"]
 
 
 async def test_auth_bearer_y_env_faltante(server, loopback, monkeypatch):
