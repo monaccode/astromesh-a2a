@@ -33,6 +33,12 @@ async def _collect(stream) -> list[Event]:
     return [event async for event in stream]
 
 
+async def _drain(stream, seen: list[Event]) -> None:
+    """Append events to ``seen`` one by one, so it keeps what arrived before a raise."""
+    async for event in stream:
+        seen.append(event)  # noqa: PERF401 - a comprehension would lose them on a raise
+
+
 # ---- stream ------------------------------------------------------------------------
 
 
@@ -81,9 +87,13 @@ async def test_stream_solo_rechazadas_falla_al_completar(server, loopback):
     async with RemoteAgent(server.base, policy=_policy()) as agent:
         seen = []
         with pytest.raises(PolicyRejected) as exc:
-            seen.extend([e async for e in agent.stream("file")])
+            await _drain(agent.stream("file"), seen)
     assert exc.value.reason == "part_kind:file"
-    assert seen == []
+    # Before the completion raised, only the in-progress statuses came through: the
+    # file-only artifact was dropped and no final status was ever emitted.
+    assert seen
+    assert [e.kind for e in seen] == ["status"] * len(seen)
+    assert {e.payload["state"] for e in seen} <= {"submitted", "working"}
 
 
 async def test_status_con_partes_rechazadas_se_emite(server, loopback):
@@ -118,22 +128,29 @@ async def test_stream_infinito_corta(server, loopback, policy_kw, why):
     seen = []
     async with RemoteAgent(server.base, policy=_policy(**policy_kw)) as agent:
         with pytest.raises(A2ATimeout) as exc:
-            seen.extend([e async for e in agent.stream("forever")])
+            await _drain(agent.stream("forever"), seen)
         # The agent is still usable after a cut stream.
         assert (await agent.send("hi")).answer == "echo:hi"
     assert why in str(exc.value)
     assert time.monotonic() - started < 3.0  # far less than the ~4 s the remote would take
-    assert seen == []  # the stream raised: the list was never filled
+    # Events arrived until the cut, none of them final.
+    assert seen
+    assert all(e.kind == "status" and not e.payload["final"] for e in seen)
+    if why == "events":
+        assert len(seen) == policy_kw["max_events"]  # one event per SDK event, then the cut
 
 
-async def _settle(server) -> None:
-    """Wait until connections left by earlier tests are gone (count stable 0.2 s)."""
-    last, stable_since = server.connections(), time.monotonic()
-    while time.monotonic() - stable_since < 0.2:
+async def _settle(server, within: float = 5.0) -> None:
+    """Wait until connections left by earlier tests are gone: back to the baseline (none).
+
+    Every agent in this module is closed, so the reference server's baseline is zero
+    open connections; a count that never gets there is a leak, and fails here.
+    """
+    deadline = time.monotonic() + within
+    while server.connections() > 0:
+        if time.monotonic() > deadline:
+            pytest.fail(f"{server.connections()} connection(s) still open after {within}s")
         await asyncio.sleep(0.02)
-        now = server.connections()
-        if now != last:
-            last, stable_since = now, time.monotonic()
 
 
 async def _closed_one(server, before: int, within: float = 1.0) -> bool:
