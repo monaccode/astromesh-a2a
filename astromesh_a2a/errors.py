@@ -41,7 +41,3 @@ class A2ATimeout(A2AError):  # noqa: N818
 
 class UnsupportedVersion(A2AError):  # noqa: N818
     """The remote speaks an A2A protocol version this library does not support."""
-
-
-class ConfirmationRequired(A2AError):  # noqa: N818
-    """The remote asked for a confirmation that only a human can give."""

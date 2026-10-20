@@ -45,18 +45,32 @@ def test_partes_file_rechazadas_por_defecto():
 
 def test_presupuesto_llamadas():
     m = BudgetMeter(Budget(max_calls=2))
-    m.charge_call()
-    m.charge_call()
+    m.admit()
+    m.admit()
     with pytest.raises(PolicyRejected, match="budget"):
-        m.charge_call()
-    BudgetMeter(None).charge_call()
+        m.admit()
+    assert m.calls == 2  # a refused call is not counted
+    unlimited = BudgetMeter(None)
+    for _ in range(5):
+        unlimited.admit()
+    assert unlimited.remaining_seconds() is None
 
 
 def test_presupuesto_segundos():
     m = BudgetMeter(Budget(max_seconds=1.0))
-    m.charge_seconds(0.6)
-    with pytest.raises(PolicyRejected):
-        m.charge_seconds(0.6)
+    m.admit()
+    m.record_seconds(0.6)
+    assert m.remaining_seconds() == pytest.approx(0.4)
+    m.admit()  # some seconds are left: admitted
+    m.record_seconds(0.6)  # the call already happened: recorded, never raises
+    assert m.remaining_seconds() == 0.0
+    with pytest.raises(PolicyRejected, match="budget"):
+        m.admit()
+
+
+def test_meter_sin_metodos_legados():
+    assert not hasattr(BudgetMeter, "charge_call")
+    assert not hasattr(BudgetMeter, "charge_seconds")
 
 
 def test_errores_son_a2a_error():
@@ -94,10 +108,19 @@ def test_trucos_de_host_rechazados(tricky):
         Policy(allowed=("a.com",)).check_card_url(tricky)
 
 
-def test_puerto_y_userinfo_legitimo_se_ignoran():
-    p = Policy(allowed=("a.com",))
-    p.check_card_url("https://a.com:8443/x")
-    p.check_card_url("https://user@a.com/x")
+def test_puerto_se_ignora():
+    Policy(allowed=("a.com",)).check_card_url("https://a.com:8443/x")
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://user@a.com/x", "https://user:pw@a.com/x", "https://:pw@a.com/", "https://@a.com/"],
+)
+def test_userinfo_rechazado(url):
+    # Credentials never ride in the URL (they would leak into logs and the card fetch).
+    with pytest.raises(PolicyRejected) as exc:
+        Policy(allowed=("a.com",)).check_card_url(url)
+    assert exc.value.reason == "url"
 
 
 def test_str_pelado_rechazado():
@@ -109,13 +132,13 @@ def test_str_pelado_rechazado():
 
 def test_segundos_negativos_y_tope():
     m = BudgetMeter(Budget(max_seconds=1.0))
-    with pytest.raises(ValueError, match=r"seconds|reserved"):
-        m.charge_seconds(-1)
-    m.charge_seconds(1.0)
+    m.record_seconds(-1)  # clamped: negative time never refunds the budget
+    assert m.seconds == 0.0
+    m.record_seconds(1.0)
     with pytest.raises(PolicyRejected):
-        m.charge_seconds(0.01)
+        m.admit()
 
 
 def test_max_calls_cero_rechaza_la_primera():
     with pytest.raises(PolicyRejected):
-        BudgetMeter(Budget(max_calls=0)).charge_call()
+        BudgetMeter(Budget(max_calls=0)).admit()

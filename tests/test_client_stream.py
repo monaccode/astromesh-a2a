@@ -10,6 +10,7 @@ import pytest
 
 from astromesh_a2a import (
     A2ATimeout,
+    AgentClosedError,
     BlockedDestination,
     Budget,
     Event,
@@ -100,7 +101,7 @@ async def test_stream_tras_cerrar_el_agente(server, loopback):
     agent = RemoteAgent(server.base, policy=_policy())
     events = agent.stream("hi")
     await agent.aclose()
-    with pytest.raises(RuntimeError, match="closed"):
+    with pytest.raises(AgentClosedError, match="closed"):
         await events.__anext__()
     assert agent._card_http is None
     assert agent._rpc_http is None

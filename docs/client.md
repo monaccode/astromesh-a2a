@@ -152,7 +152,9 @@ All inherit from `A2AError`.
 | `TaskFailed` | The remote task failed/was rejected/canceled (`remote=True`), or the call failed in a way that cannot be classified (`remote=False`, generic message, the task may be alive) |
 | `A2ATimeout` | A call or stream exceeded `timeout` or `max_events` |
 | `UnsupportedVersion` | The remote does not speak A2A 1.x over JSON-RPC |
-| `ConfirmationRequired` | Reserved; 0.1.0 never raises it (confirmations come back as `input_required`) |
 
-`LoopBindingError` (a `RuntimeError`, not an `A2AError`) means the agent was used from
-another event loop.
+Confirmations are not errors: they come back as `input_required` (see above).
+
+Two local errors are `RuntimeError`s, not `A2AError`s, and are never translated:
+`LoopBindingError` means the agent was used from another event loop, and
+`AgentClosedError` that it was used after `aclose()`.

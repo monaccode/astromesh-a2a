@@ -79,7 +79,11 @@ class Policy:
             raise ValueError("Policy.card_ttl must be >= 0")
 
     def check_card_url(self, url: str) -> None:
-        """Raise PolicyRejected unless ``url`` is https (or opted-in http) and allowed."""
+        """Raise PolicyRejected unless ``url`` is https (or opted-in http) and allowed.
+
+        A URL with user info (``user:pw@host``) is refused (``"url"``): credentials go in
+        ``Auth``, never in the URL.
+        """
         if not isinstance(url, str) or any(
             c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url
         ):
@@ -89,6 +93,8 @@ class Policy:
             host = (parts.hostname or "").lower()
         except ValueError:
             raise PolicyRejected("url") from None
+        if "@" in parts.netloc:
+            raise PolicyRejected("url")
         schemes = {"https", "http"} if self.allow_insecure_http else {"https"}
         if parts.scheme.lower() not in schemes:
             raise PolicyRejected("scheme")
@@ -120,18 +126,16 @@ class Policy:
 
 
 class BudgetMeter:
-    """Tracks calls and seconds used against a Budget (one per remote)."""
+    """Tracks calls and seconds used against a Budget (one per remote).
+
+    ``admit()`` charges a call before it starts; ``record_seconds()`` adds the time it
+    took afterwards. ``RemoteAgent`` keeps one; you rarely need your own.
+    """
 
     def __init__(self, budget: Budget | None):
         self.budget = budget
         self.calls = 0
         self.seconds = 0.0
-
-    def charge_call(self) -> None:
-        self.calls += 1
-        b = self.budget
-        if b and b.max_calls is not None and self.calls > b.max_calls:
-            raise PolicyRejected("budget")
 
     def admit(self) -> None:
         """Charge one call BEFORE it starts; ``PolicyRejected("budget")`` if none is left.
@@ -156,11 +160,3 @@ class BudgetMeter:
     def record_seconds(self, s: float) -> None:
         """Add the time a call took; never raises (the call already happened)."""
         self.seconds += max(0.0, s)
-
-    def charge_seconds(self, s: float) -> None:
-        if s < 0:
-            raise ValueError("seconds must be >= 0")
-        self.seconds += s
-        b = self.budget
-        if b and b.max_seconds is not None and self.seconds > b.max_seconds:
-            raise PolicyRejected("budget")

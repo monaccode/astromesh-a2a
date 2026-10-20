@@ -174,6 +174,8 @@ def test_serve_sin_auth_no_arranca(monkeypatch):
         serve(Recorder(), _card())
     with pytest.raises(ValueError, match="auth"):
         create_app(Recorder(), _card(), auth=None)
+    with pytest.raises(ValueError, match="auth"):
+        create_app(Recorder(), _card())  # same default as serve(): still refused
     assert runs == []
     serve(Recorder(), _card(), insecure=True, port=8123)
     assert len(runs) == 1

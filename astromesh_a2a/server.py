@@ -347,7 +347,7 @@ def create_app(
     handler: Handler,
     card: CardSpec,
     *,
-    auth: AuthCallable | None,
+    auth: AuthCallable | None = None,
     insecure: bool = False,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     handler_timeout: float | None = DEFAULT_HANDLER_TIMEOUT,

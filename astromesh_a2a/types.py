@@ -28,7 +28,7 @@ class Result:
     ``trace`` is the redacted per-stage trace of the call.
     """
 
-    status: str
+    status: Literal["completed", "input_required", "auth_required"]
     answer: str
     data: list[dict[str, Any]]
     task_id: str | None

@@ -97,8 +97,9 @@ _FINAL_STATES = frozenset(
 _T = TypeVar("_T")
 
 
-class _ClosedError(RuntimeError):
-    """The RemoteAgent was closed (passes through unchanged, never translated)."""
+class AgentClosedError(RuntimeError):
+    """The ``RemoteAgent`` was closed (``aclose()``) and then used. Local; never
+    translated."""
 
 
 class LoopBindingError(RuntimeError):
@@ -112,7 +113,7 @@ LOOP_ERROR = "RemoteAgent is bound to another event loop; create one RemoteAgent
 # (an SDK bug on a malformed response included) becomes a generic TaskFailed, whose
 # message never quotes the remote. CancelledError/KeyboardInterrupt are BaseExceptions
 # and are never caught.
-_LOCAL_SENTINELS = (A2AError, _ClosedError, LoopBindingError)
+_LOCAL_SENTINELS = (A2AError, AgentClosedError, LoopBindingError)
 # Remote JSON-RPC errors that mean the task is gone or cannot take this message.
 _TASK_GONE = (
     sdk_errors.TaskNotFoundError,
@@ -310,7 +311,7 @@ class RemoteAgent:
 
     def _check_open(self) -> None:
         if self._closed:
-            raise _ClosedError("RemoteAgent is closed")
+            raise AgentClosedError("RemoteAgent is closed")
 
     def _bind_loop(self) -> None:
         """Record the running loop on first I/O; refuse any other loop afterwards.
