@@ -67,7 +67,9 @@ print(result.status, result.answer, result.trace)
 
 `result.status` es `completed`, o `input_required` con la pregunta del remoto en
 `result.pending`; `reply(task_id, text)` la contesta, `stream(text)` entrega eventos,
-`cancel(task_id)` corta una tarea y `card()` devuelve la card revisada. Los errores tienen
+`cancel(task_id)` corta una tarea y `card()` devuelve la card revisada. Para tareas
+largas, `submit(text)` vuelve enseguida y `get_task(task_id)`, `subscribe(task_id)` y
+`list_tasks()` las siguen, bajo la misma política. Los errores tienen
 tipo (`PolicyRejected`, `BlockedDestination`, `TaskFailed`, `A2ATimeout`,
 `UnsupportedVersion`, todos `A2AError`). Guía: [docs/client.md](https://github.com/monaccode/astromesh-a2a/blob/main/docs/client.md).
 

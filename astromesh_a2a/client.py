@@ -13,8 +13,9 @@ Flow of a call (ADR 0001 §1, §5):
    budget, if less), on top of httpx timeouts. A stream is also capped at
    ``policy.max_events`` events; either cap raises ``A2ATimeout``.
 5. Budgets: one ``BudgetMeter`` per ``RemoteAgent``. Each ``send``/``reply``/``stream``/
-   ``cancel`` is admitted BEFORE any request (card included) leaves; an exhausted budget
-   raises ``PolicyRejected("budget")`` and nothing is sent. The time each call took is
+   ``cancel``/``submit``/``get_task``/``list_tasks``/``subscribe`` is admitted BEFORE any
+   request (card included) leaves; an exhausted budget raises ``PolicyRejected("budget")``
+   and nothing is sent. The time each call took is
    recorded afterwards.
 6. The vetted card is cached ``policy.card_ttl`` seconds; then it is fetched and vetted
    again (all checks), and the SDK clients are rebuilt over the new card.
@@ -43,6 +44,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
 import sys
 import time
 import uuid
@@ -59,11 +61,15 @@ from a2a.types import (
     AgentCard,
     AgentInterface,
     CancelTaskRequest,
+    GetTaskRequest,
+    ListTasksRequest,
     Message,
     Part,
     Role,
     SendMessageRequest,
     StreamResponse,
+    SubscribeToTaskRequest,
+    Task,
     TaskState,
     TaskStatus,
 )
@@ -82,7 +88,7 @@ from astromesh_a2a.errors import (
 )
 from astromesh_a2a.policy import BudgetMeter, Policy
 from astromesh_a2a.trace import Trace
-from astromesh_a2a.types import Auth, Event, Origin, Result
+from astromesh_a2a.types import Auth, Event, Origin, Result, TaskPage
 
 WELL_KNOWN_CARD = "/.well-known/agent-card.json"
 A2A_VERSION = "1.0"
@@ -99,6 +105,33 @@ _FINAL_STATES = frozenset(
         TaskState.TASK_STATE_AUTH_REQUIRED,
     }
 )
+_FAILED_STATES = frozenset(
+    {
+        TaskState.TASK_STATE_FAILED,
+        TaskState.TASK_STATE_CANCELED,
+        TaskState.TASK_STATE_REJECTED,
+    }
+)
+_WAITING_STATES = frozenset(
+    {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
+)
+_RUNNING_STATES = frozenset({TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING})
+_KNOWN_STATES = frozenset(
+    {TaskState.TASK_STATE_COMPLETED, *_FAILED_STATES, *_WAITING_STATES, *_RUNNING_STATES}
+)
+# list_tasks(status=...): our lower-case names of the A2A task states.
+_STATUS_FILTER = {
+    TaskState.Name(state).removeprefix("TASK_STATE_").lower(): state
+    for state in (
+        TaskState.TASK_STATE_COMPLETED,
+        *_FAILED_STATES,
+        *_WAITING_STATES,
+        *_RUNNING_STATES,
+    )
+}
+_MAX_PAGE_SIZE = 100  # the A2A/SDK cap for ListTasks
+_MAX_ID = 256  # task ids, context ids and page tokens we send
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _T = TypeVar("_T")
 
 
@@ -215,8 +248,30 @@ def _state_name(state: int) -> str:
     return TaskState.Name(state).removeprefix("TASK_STATE_").lower()
 
 
+def _check_id(name: str, value: Any, *, optional: bool = False, empty: bool = False) -> None:
+    """An id we send (task, context, page token): a str of at most ``_MAX_ID`` chars,
+    no control characters. ``ValueError`` before anything is sent.
+
+    ``optional``: ``None`` is fine. ``empty``: ``""`` is fine (means "none", as
+    ``send(context_id="")`` always did).
+    """
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a str" + (" or None" if optional else ""))
+    if not value:
+        if empty:
+            return
+        raise ValueError(f"{name} must not be empty")
+    if len(value) > _MAX_ID:
+        raise ValueError(f"{name} is longer than {_MAX_ID} characters")
+    if _CONTROL_CHARS.search(value):
+        raise ValueError(f"{name} must not contain control characters")
+
+
 class EventStream:
-    """What ``RemoteAgent.stream()`` returns: an async iterator of ``Event``.
+    """What ``RemoteAgent.stream()`` and ``RemoteAgent.subscribe()`` return: an async
+    iterator of ``Event``.
 
     Nothing is sent until the first ``__anext__``. ``trace`` holds the redacted trace so
     far. To stop early, use ``async with agent.stream(...) as events:`` or ``aclose()``:
@@ -466,6 +521,7 @@ class RemoteAgent:
         ``pending``; only an explicit ``reply()`` continues the task.
         """
         self._check_open()
+        _check_id("context_id", context_id, optional=True, empty=True)
         data = _json_data(data)
         trace = Trace()
         final = await self._guarded(
@@ -473,17 +529,22 @@ class RemoteAgent:
         )
         return self._to_result(final, trace)
 
-    async def reply(self, task_id: str, text: str) -> Result:
+    async def reply(self, task_id: str, text: str, *, context_id: str | None = None) -> Result:
         """Answer a task that asked for input: a new message on the SAME task.
 
         This is the only way a pending task continues; the caller (a model or a human
         on this side) decides the answer.
+
+        ``context_id`` is the task's context. Without it, the one this agent remembers
+        for ``task_id`` (from an earlier result or event) is used, if any; pass it when
+        the task came from elsewhere (another ``RemoteAgent``, a restart, a store).
         """
         self._check_open()
-        if not isinstance(task_id, str) or not task_id:
-            raise ValueError("task_id must be a non-empty str")
+        _check_id("task_id", task_id)
+        _check_id("context_id", context_id, optional=True)
         trace = Trace()
-        context_id = self._contexts.get(task_id)
+        if context_id is None:
+            context_id = self._contexts.get(task_id)
         final = await self._guarded(
             lambda: self._send_blocking(text, context_id, None, trace, task_id=task_id),
             trace,
@@ -498,8 +559,7 @@ class RemoteAgent:
         ``TaskFailed`` if the task already ended in another final state.
         """
         self._check_open()
-        if not isinstance(task_id, str) or not task_id:
-            raise ValueError("task_id must be a non-empty str")
+        _check_id("task_id", task_id)
         trace = Trace()
         task = await self._guarded(lambda: self._cancel(task_id, trace), trace)
         state = task.status.state
@@ -530,8 +590,156 @@ class RemoteAgent:
         garbage collector.
         """
         self._check_open()
+        _check_id("context_id", context_id, optional=True, empty=True)
         trace = Trace()
-        return EventStream(self._stream(text, context_id, trace), trace)
+
+        def open_events() -> Any:
+            context, traceparent = self._call_context(trace)
+            request = self._message_request(text, context_id, None, None, traceparent)
+            trace.add(
+                "send",
+                method="SendStreamingMessage",
+                origin=self.origin.value,
+                context_id=context_id,
+            )
+            return self._sdk_client(streaming=True).send_message(request, context=context)
+
+        return EventStream(self._stream(open_events, trace), trace)
+
+    # ---- tasks --------------------------------------------------------------------
+
+    async def submit(
+        self, text: str, *, context_id: str | None = None, data: dict | None = None
+    ) -> Result:
+        """Send one message WITHOUT waiting for the task (A2A ``returnImmediately``).
+
+        Returns as soon as the remote has the task, usually ``submitted`` or ``working``
+        with its ``task_id``; a fast remote may already be further along (any task
+        status, see ``Result``). Follow it with ``get_task()``, ``subscribe()`` or
+        ``cancel()``. A remote that answers with a plain message (no task) comes back
+        ``completed``, as in ``send()``. Same policy checks as ``send()``; a task that
+        ended badly is a status here (``failed``...), not an error.
+        """
+        self._check_open()
+        _check_id("context_id", context_id, optional=True, empty=True)
+        data = _json_data(data)
+        trace = Trace()
+        final = await self._guarded(
+            lambda: self._send_blocking(text, context_id, data, trace, immediate=True), trace
+        )
+        if final.WhichOneof("payload") == "task":
+            return self._task_result(final.task, trace, strict=True)
+        return self._to_result(final, trace)
+
+    async def get_task(self, task_id: str) -> Result:
+        """The task as the remote has it now (A2A ``GetTask``), as a ``Result``.
+
+        Any status (see ``Result``): ``submitted``/``working`` carry the output so far,
+        ``failed``/``canceled``/``rejected`` the remote's status message; none of them
+        raises. Same part policy as ``send()``. An unknown task (or another caller's)
+        raises ``TaskFailed(remote=True)``.
+        """
+        self._check_open()
+        _check_id("task_id", task_id)
+        trace = Trace()
+
+        async def run() -> Task:
+            context, _ = self._call_context(trace)
+            trace.add("send", method="GetTask", task_id=task_id)
+            request = GetTaskRequest(id=task_id, history_length=0)
+            return await self._sdk_client(streaming=False).get_task(request, context=context)
+
+        task = await self._guarded(run, trace)
+        return self._task_result(task, trace, strict=True)
+
+    async def list_tasks(
+        self,
+        *,
+        context_id: str | None = None,
+        status: str | None = None,
+        page_size: int | None = None,
+        page_token: str | None = None,
+    ) -> TaskPage:
+        """One page of this caller's tasks on the remote (A2A ``ListTasks``).
+
+        Filters: ``context_id`` and ``status`` (a ``Result`` status name, e.g.
+        ``"working"``). ``page_size`` is 1-100 (``None``: the remote's default); pass
+        ``TaskPage.next_page_token`` as ``page_token`` for the next page. Each task goes
+        through the part policy like ``get_task()``, except that a task whose parts were
+        ALL of a refused kind is listed with them dropped (traced) instead of failing the
+        page; an oversized part still raises ``PolicyRejected("part_size")``. The page is
+        one response body, capped by ``policy.max_bytes``: keep pages small.
+        """
+        self._check_open()
+        _check_id("context_id", context_id, optional=True)
+        _check_id("page_token", page_token, optional=True)
+        if status is not None and status not in _STATUS_FILTER:
+            raise ValueError(f"status must be one of {sorted(_STATUS_FILTER)} or None")
+        if page_size is not None and (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or not 1 <= page_size <= _MAX_PAGE_SIZE
+        ):
+            raise ValueError(f"page_size must be an int from 1 to {_MAX_PAGE_SIZE} or None")
+        trace = Trace()
+        request = ListTasksRequest(
+            context_id=context_id or "",
+            page_token=page_token or "",
+            history_length=0,
+            include_artifacts=True,
+        )
+        if status is not None:
+            request.status = _STATUS_FILTER[status]
+        if page_size is not None:
+            request.page_size = page_size
+
+        async def run() -> Any:
+            context, _ = self._call_context(trace)
+            trace.add("send", method="ListTasks", context_id=context_id, status=status)
+            return await self._sdk_client(streaming=False).list_tasks(request, context=context)
+
+        page = await self._guarded(run, trace)
+        tasks: list[Result] = []
+        for task in page.tasks:
+            if task.status.state not in _KNOWN_STATES:  # one bad task never sinks the page
+                trace.add("rejection", task_id=task.id or None, reason="unknown_state")
+                continue
+            # Listing does not feed reply()'s context map: it could evict pending tasks.
+            result = self._task_result(task, trace, strict=False, remember=False)
+            result.trace = []
+            tasks.append(result)
+        return TaskPage(
+            tasks=tasks,
+            next_page_token=page.next_page_token or None,
+            total_size=page.total_size,
+            trace=trace.to_dict(),
+        )
+
+    def subscribe(self, task_id: str) -> EventStream:
+        """Follow a live task's events (A2A ``SubscribeToTask``), e.g. after ``submit()``.
+
+        The first events are the task as it is now (its artifacts so far, then its
+        status); then events as they arrive, with exactly the rules, caps and policy of
+        ``stream()``. A task waiting for input yields that status and ends. A task that
+        already ended (completed, failed...) cannot be subscribed to:
+        ``TaskFailed(remote=True)``; use ``get_task()``. Needs a remote whose card
+        declares streaming (else ``TaskFailed``). Nothing is sent until the first event
+        is read.
+        """
+        self._check_open()
+        _check_id("task_id", task_id)
+        trace = Trace()
+
+        def open_events() -> Any:
+            assert self._card is not None
+            if not self._card.capabilities.streaming:
+                raise TaskFailed("remote does not support streaming (subscribe needs it)")
+            context, _ = self._call_context(trace)
+            trace.add("send", method="SubscribeToTask", task_id=task_id)
+            request = SubscribeToTaskRequest(id=task_id)
+            return self._sdk_client(streaming=True).subscribe(request, context=context)
+
+        return EventStream(self._stream(open_events, trace), trace)
 
     # ---- adapters -----------------------------------------------------------------
 
@@ -620,10 +828,14 @@ class RemoteAgent:
         trace: Trace,
         *,
         task_id: str | None = None,
+        immediate: bool = False,
     ) -> StreamResponse:
         context, traceparent = self._call_context(trace)
         request = self._message_request(text, context_id, data, task_id, traceparent)
         fields: dict[str, Any] = {"task_id": task_id} if task_id else {}
+        if immediate:
+            request.configuration.return_immediately = True
+            fields["return_immediately"] = True
         trace.add(
             "send",
             method="SendMessage",
@@ -645,9 +857,9 @@ class RemoteAgent:
         client = self._sdk_client(streaming=False)
         return await client.cancel_task(CancelTaskRequest(id=task_id), context=context)
 
-    async def _stream(
-        self, text: str, context_id: str | None, trace: Trace
-    ) -> AsyncIterator[Event]:
+    async def _stream(self, open_events: Callable[[], Any], trace: Trace) -> AsyncIterator[Event]:
+        """The guarded event loop of ``stream()`` and ``subscribe()``: ``open_events()``
+        runs once the card is vetted and returns the SDK's ``StreamResponse`` iterator."""
         self._check_open()
         self._bind_loop()
         self._meter.admit()
@@ -662,15 +874,7 @@ class RemoteAgent:
             try:
                 async with _deadline(limit):
                     await self._vetted_card(trace)
-                context, traceparent = self._call_context(trace)
-                request = self._message_request(text, context_id, None, None, traceparent)
-                trace.add(
-                    "send",
-                    method="SendStreamingMessage",
-                    origin=self.origin.value,
-                    context_id=context_id,
-                )
-                events = self._sdk_client(streaming=True).send_message(request, context=context)
+                events = open_events()
                 while True:
                     # The deadline covers the waits on the remote, never the caller's code
                     # (a yield inside a timeout block would cancel the caller instead).
@@ -846,6 +1050,43 @@ class RemoteAgent:
         detail = f": {_remote_text(status_text)}" if status_text else ""
         raise TaskFailed(f"remote task {name}{detail}", remote=True)
 
+    def _task_result(
+        self, task: Task, trace: Trace, *, strict: bool, remember: bool = True
+    ) -> Result:
+        """A task as it is, in any state (the task API).
+
+        ``strict``: parts all of a refused kind raise ``PolicyRejected`` where ``send()``
+        would (a completion, a question); otherwise they are dropped and traced.
+        Oversized parts always raise.
+        """
+        state = task.status.state
+        name = _state_name(state)
+        accept = self._accept if strict else self._accept_lenient
+        status_parts = task.status.message.parts
+        if state == TaskState.TASK_STATE_COMPLETED:
+            parts = [p for a in task.artifacts for p in a.parts] or list(status_parts)
+            answer, data = accept(parts, trace)
+            pending = None
+        elif state in _WAITING_STATES:
+            question, _ = accept(status_parts, trace)
+            answer, data, pending = "", [], question or None
+        elif state in _RUNNING_STATES:  # the output so far
+            answer, data = self._accept_lenient([p for a in task.artifacts for p in a.parts], trace)
+            pending = None
+        elif state in _FAILED_STATES:  # the remote's own account of it
+            answer, data = self._accept_lenient(status_parts, trace)
+            pending = None
+        else:
+            raise TaskFailed(f"remote task in unknown state {_remote_text(name)}", remote=True)
+        return self._finish(
+            trace, name, answer, data, task.id, task.context_id, pending, remember=remember
+        )
+
+    def _accept_lenient(self, parts: Any, trace: Trace) -> tuple[str, list[dict[str, Any]]]:
+        """``_accept`` that never raises for refused kinds (they are traced, dropped)."""
+        text, data, _ = self._accept_parts(parts, trace)
+        return text, data
+
     def _finish(
         self,
         trace: Trace,
@@ -855,9 +1096,12 @@ class RemoteAgent:
         task_id: str,
         context_id: str,
         pending: str | None,
+        *,
+        remember: bool = True,
     ) -> Result:
         trace.add("result", status=status, task_id=task_id or None, parts=len(data))
-        self._remember(task_id, context_id)
+        if remember:
+            self._remember(task_id, context_id)
         return Result(
             status=status,
             answer=answer,

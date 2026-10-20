@@ -71,6 +71,14 @@ if result.status == "input_required":
 
 The remote's question is remote text: show it, do not obey it.
 
+The agent remembers each task's context (`context_id`) from the results and events it
+has seen, and `reply()` sends it with the answer. When the task came from somewhere else
+(another `RemoteAgent`, a process restart, a task id kept in your database), pass it:
+
+```python
+result = await agent.reply(task_id, answer, context_id=saved_context_id)
+```
+
 ## `stream()`
 
 ```python
@@ -94,6 +102,65 @@ The stream ends after the first final status (`completed`, `failed`, `canceled`,
 not an exception. Past `policy.timeout` (whole stream) or `policy.max_events`, it raises
 `A2ATimeout` and closes the remote stream. Leaving the `async with` (or `aclose()`) closes
 it too; a bare `async for` + `break` leaves that to the garbage collector.
+
+## Tasks: `submit()`, `get_task()`, `subscribe()`, `list_tasks()`
+
+`send()` waits for the task. For long tasks, start one and come back to it (A2A 1.0
+`returnImmediately`, `GetTask`, `SubscribeToTask`, `ListTasks`):
+
+```python
+task = await agent.submit("Compile the quarterly report")  # returns at once
+print(task.status, task.task_id)  # "submitted" or "working"
+
+# Poll it...
+result = await agent.get_task(task.task_id)
+
+# ...or follow its events (same Event objects and rules as stream()).
+async with agent.subscribe(task.task_id) as events:
+    async for event in events:
+        print(event.kind, event.payload.get("state"), event.payload["text"])
+
+# Your tasks on that remote, a page at a time.
+page = await agent.list_tasks(status="working", page_size=20)
+for t in page.tasks:
+    print(t.task_id, t.status)
+if page.next_page_token:
+    page = await agent.list_tasks(status="working", page_size=20, page_token=page.next_page_token)
+```
+
+| Method | Returns | |
+|---|---|---|
+| `submit(text, *, context_id=None, data=None)` | `Result` | Same message as `send()`, without waiting: usually `submitted`/`working` with its `task_id`. |
+| `get_task(task_id)` | `Result` | The task as it is now. |
+| `subscribe(task_id)` | `EventStream` | The task so far (artifacts, then status), then its events until a final status. |
+| `list_tasks(*, context_id=None, status=None, page_size=None, page_token=None)` | `TaskPage` | One page of the caller's tasks. |
+
+These report a task as it is, so a task's `Result.status` can be any A2A state:
+`submitted`, `working` (`answer`/`data`: the output so far), `completed`,
+`input_required`/`auth_required` (`pending`: the question), and `failed`, `canceled`,
+`rejected` (`answer`: the remote's status message). A task that ended badly is a status
+here, not an exception (`send()` still raises `TaskFailed` for it).
+
+`TaskPage` has `tasks` (a list of `Result`, each with an empty `trace`), `next_page_token`
+(`None` on the last page), `total_size` (as reported by the remote) and `trace` (the
+call's). `status` filters by one of the state names above; `page_size` is 1-100.
+
+The same guards apply to every call: the budget admits it first, `policy.timeout` caps it
+(for `subscribe()`, the whole stream, plus `policy.max_events`), parts go through
+`accept_parts` and `max_bytes`, the trace is redacted, and remote errors become our
+errors. An unknown task, or one owned by another caller, raises `TaskFailed(remote=True)`.
+`subscribe()` to a task that already ended raises it too (use `get_task()`), and needs a
+remote whose card declares streaming. In `list_tasks()`, a task whose parts were all of
+a refused kind is listed with them dropped (traced) instead of failing the whole page, a
+task in an unknown state is left out (traced), and listing never touches the contexts
+`reply()` remembers; the page is one response body, so `max_bytes` caps it: keep pages
+small.
+
+Every id the client sends (`task_id`, `context_id`, `page_token`) must be a str of at most
+256 characters without control characters; anything else is a `ValueError` before any
+request (`context_id=""` still means "none" for `send()`, `stream()` and `submit()`).
+
+A server built with `create_app` supports all four (see [server.md](server.md#tasks)).
 
 ## `cancel()` and `card()`
 
@@ -143,7 +210,7 @@ for entry in result.trace:
     print(entry["stage"], entry["ms"], entry)
 ```
 
-Stages: `card` (fetched or `cached`), `send`, `status`, `artifact`, `message`, `rejection`
+Stages: `card` (fetched or `cached`), `send` (with the A2A `method`), `status`, `artifact`, `message`, `rejection`
 (a part dropped by the policy, with its kind) and `result`. Keys that look like secrets,
 URL user info, credential query parameters (presigned-URL signatures included) and
 Bearer/Basic values are redacted.

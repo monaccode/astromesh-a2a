@@ -12,7 +12,7 @@ from astromesh_a2a.errors import (
 )
 from astromesh_a2a.policy import Budget, BudgetMeter, Policy
 from astromesh_a2a.trace import Trace
-from astromesh_a2a.types import Auth, Event, Incoming, Origin, Outgoing, Result
+from astromesh_a2a.types import Auth, Event, Incoming, Origin, Outgoing, Result, TaskPage
 
 if TYPE_CHECKING:  # the server needs the 'server' extra; type checkers still see it
     from astromesh_a2a.server import api_key_auth as api_key_auth
@@ -37,7 +37,7 @@ def __dir__() -> list[str]:
     return sorted({*globals(), *_SERVER})
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "A2AError",
@@ -61,6 +61,7 @@ __all__ = [
     "Result",
     "Skill",
     "TaskFailed",
+    "TaskPage",
     "Trace",
     "UnsupportedVersion",
 ]

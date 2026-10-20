@@ -1,6 +1,6 @@
 [project]
 name = "astromesh-a2a"
-version = "0.1.0"
+version = "0.1.1"
 description = "Agent-to-Agent (A2A) for any agent framework: a safe client and server on the official A2A SDK, with egress guards, remote-agent policy, traces and an attack eval."
 readme = "README.md"
 license = "Apache-2.0"

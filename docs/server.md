@@ -138,7 +138,7 @@ with JSON-RPC `-32009`.
 ## Sessions
 
 Tasks are scoped by owner, the identity your `auth` returned: one caller cannot get,
-cancel or reply to another caller's task, even knowing its id. That scoping lives in the
+list, subscribe to, cancel or reply to another caller's task, even knowing its id. That scoping lives in the
 task store. A custom `task_store` must keep it: resolve the owner from the
 `ServerCallContext` the SDK passes to every `save`/`get`/`list`/`delete` and filter by it,
 as the SDK's stores do (`owner_resolver`, default `resolve_user_scope`). With
@@ -146,6 +146,20 @@ as the SDK's stores do (`owner_resolver`, default `resolve_user_scope`). With
 
 `context_id` is chosen by the caller and is not scoped: two callers can send the same one.
 Key memory and session state by `msg.session_key`, never by `context_id` alone.
+
+## Tasks
+
+Besides `SendMessage` (blocking and SSE) and `CancelTask`, the app serves the rest of the
+A2A 1.0 task methods through the SDK's request handler, all scoped by owner as above:
+
+- **`returnImmediately`** (`RemoteAgent.submit()`): the request returns as soon as the
+  task exists (`submitted`) and your handler keeps running in the server, still capped by
+  `handler_timeout` (past it the task fails as usual).
+- **`GetTask`** (`get_task()`), **`ListTasks`** (`list_tasks()`, filtered by context and
+  state, paginated) and **`SubscribeToTask`** (`subscribe()`, for a task that has not
+  ended).
+
+The handler model does not change: one `async (Incoming) -> Outgoing` call per message.
 
 ## Serving a LangChain runnable
 

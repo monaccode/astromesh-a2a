@@ -6,6 +6,43 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-20
+
+### Added
+
+- Task API on `RemoteAgent`, over the A2A 1.0 methods: `submit()` (`SendMessage` with
+  `returnImmediately`: returns as soon as the task exists), `get_task()` (`GetTask`),
+  `subscribe()` (`SubscribeToTask`, an `EventStream` with the same events, caps and policy
+  as `stream()`) and `list_tasks()` (`ListTasks`, filtered by context and state,
+  paginated) returning the new `TaskPage`. Every call goes through the budget, timeout,
+  part policy, trace redaction and error translation of `send()`/`stream()`. These
+  report a task as it is, so `Result.status` gains `submitted`, `working`, `failed`,
+  `canceled` and `rejected` for them; `send()`/`reply()` are unchanged.
+- `RemoteAgent.reply(task_id, text, *, context_id=None)`: the task's context can be
+  passed explicitly (a task from another `RemoteAgent`, a restart, a store); without it
+  the remembered one is used, as before.
+- `astromesh_a2a.adapters` exports `tool_description` and `PENDING_NOTE` (also still in
+  `adapters._common`), to build your own tool with the same safety text.
+- Server: `create_app` serves `returnImmediately` (the handler keeps running in the
+  server, still bounded by `handler_timeout`), `GetTask`, `ListTasks` and
+  `SubscribeToTask`, scoped per caller identity like `GetTask`/`CancelTask` (tested:
+  another caller cannot get, list or subscribe to a task).
+- Ids the client sends (`task_id`, `context_id`, `page_token`) are checked before any
+  request: a str of at most 256 characters, no control characters, else `ValueError`
+  (`send()`/`stream()`/`submit()` still accept `context_id=""` as "none").
+
+### Changed
+
+- `tool_description()` (the default adapter tool description) also tells the model never
+  to answer a confirmation or approval on the user's behalf, like the Astromesh core's.
+
+### Compatibility
+
+- `send()` and `reply()` return the same statuses as in 0.1.0 (`completed`,
+  `input_required`, `auth_required`) and raise as before. The new `Result.status` values
+  (`submitted`, `working`, `failed`, `canceled`, `rejected`) only come from the task API
+  (`submit()`, `get_task()`, `list_tasks()`).
+
 ## [0.1.0] - 2026-10-19
 
 First release.
@@ -87,5 +124,6 @@ First release.
   matrix 3.10-3.13, eval, adapters with every extra) and a release workflow (TestPyPI,
   smoke install from the wheel's metadata, PyPI and GitHub Release on a `v*` tag).
 
-[Unreleased]: https://github.com/monaccode/astromesh-a2a/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/monaccode/astromesh-a2a/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/monaccode/astromesh-a2a/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/monaccode/astromesh-a2a/releases/tag/v0.1.0

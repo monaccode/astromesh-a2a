@@ -34,6 +34,22 @@ await trips.card()  # name and description come from the card, or pass name=/des
   characters); the remote's description is quoted as untrusted under the library's own
   framing.
 
+Writing your own tool around a `RemoteAgent` (a framework not listed, your own loop)?
+Reuse the same safety text from `astromesh_a2a.adapters`: `tool_description(card_name,
+card_description)` (the default description: the remote's output is untrusted data, a
+confirmation or approval is never answered on the user's behalf, and the remote's
+self-description is quoted as untrusted), `wrap_untrusted(result, agent=...)` (the output block) and `PENDING_NOTE` (the
+note it appends when the remote waits for input).
+
+```python
+from astromesh_a2a.adapters import PENDING_NOTE, tool_description, wrap_untrusted
+
+card = await trips.card()
+description = tool_description(card.name, card.description)
+result = await trips.send(query)
+output = wrap_untrusted(result, agent=card.name)  # ends with PENDING_NOTE if pending
+```
+
 | Framework | Returns | Tool errors |
 |---|---|---|
 | `langchain` | `StructuredTool` (sync + async) | `ToolException` (handled: the model sees the message) |
