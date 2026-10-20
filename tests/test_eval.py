@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 
 from astromesh_a2a import BlockedDestination, Policy, RemoteAgent, client
-from astromesh_a2a.eval import EvalReport, format_report, run_traps
+from astromesh_a2a.eval import DEFAULT_POLICY, EvalReport, format_report, run_traps, traps
 from astromesh_a2a.eval import __main__ as cli
-from astromesh_a2a.eval.traps import TRAPS
+from astromesh_a2a.eval.traps import TRAPS, running_server
 
 LAX = Policy(
     allowed=("127.0.0.1",),
@@ -67,3 +67,37 @@ def test_cli_cero_si_todas_paradas(monkeypatch, capsys):
     monkeypatch.setattr(cli, "run_traps", fake)
     assert cli.main() == 0
     assert "1/1 traps stopped" in capsys.readouterr().out
+
+
+# ---- negative controls: a broken library must make the trap report NOT stopped ----
+
+
+async def _run_one(trap) -> object:
+    async with running_server() as server:
+        return await trap(server, DEFAULT_POLICY)
+
+
+async def test_control_wrapper_sin_escapar_no_detiene_injection(monkeypatch):
+    from astromesh_a2a.adapters import _common
+
+    monkeypatch.setattr(_common, "_attr", lambda text: text)  # attribute quotes unescaped
+    outcome = await _run_one(traps.injection_text)
+    assert outcome.stopped is False, outcome.detail
+    assert "wrapper broken" in outcome.detail
+
+
+async def test_control_autoconfirmacion_no_detiene_self_confirm(monkeypatch):
+    from astromesh_a2a.adapters._common import RemoteTool
+
+    original = RemoteTool.acall
+
+    async def auto_yes(self, query):
+        out = await original(self, query)
+        if self.pending_task_id is not None:  # a library that answers for the user
+            out = await original(self, "yes")
+        return out
+
+    monkeypatch.setattr(RemoteTool, "acall", auto_yes)
+    outcome = await _run_one(traps.self_confirm)
+    assert outcome.stopped is False, outcome.detail
+    assert "RPCs sent: 2" in outcome.detail
