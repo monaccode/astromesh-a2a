@@ -22,18 +22,48 @@ class Origin(str, Enum):
 class Result:
     """Outcome of a remote call.
 
-    ``status`` is ``"completed"``, ``"input_required"`` or ``"auth_required"``. On
-    completion ``answer`` joins the text parts and ``data`` holds the data parts; when the
-    remote asks for something, ``pending`` holds its question (never auto-answered).
-    ``trace`` is the redacted per-stage trace of the call.
+    ``send()``/``reply()`` return ``status`` ``"completed"``, ``"input_required"`` or
+    ``"auth_required"``. On completion ``answer`` joins the text parts and ``data`` holds
+    the data parts; when the remote asks for something, ``pending`` holds its question
+    (never auto-answered). ``trace`` is the redacted per-stage trace of the call.
+
+    The task API (``submit()``, ``get_task()``, ``list_tasks()``) reports a task as it is,
+    so its ``status`` can also be ``"submitted"`` or ``"working"`` (``answer``/``data``:
+    the output so far) or ``"failed"``, ``"canceled"``, ``"rejected"`` (``answer``: the
+    remote's status message, untrusted). Remote-written text is untrusted everywhere.
     """
 
-    status: Literal["completed", "input_required", "auth_required"]
+    status: Literal[
+        "completed",
+        "input_required",
+        "auth_required",
+        "submitted",
+        "working",
+        "failed",
+        "canceled",
+        "rejected",
+    ]
     answer: str
     data: list[dict[str, Any]]
     task_id: str | None
     context_id: str | None
     pending: str | None
+    trace: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TaskPage:
+    """One page of ``RemoteAgent.list_tasks()``.
+
+    ``tasks`` are ``Result``s (their own ``trace`` is empty: the call's trace is
+    ``trace`` here). ``next_page_token`` is ``None`` on the last page; pass it back as
+    ``page_token`` for the next one. ``total_size`` is the number of matching tasks the
+    remote reported across all pages (``0`` if it did not say).
+    """
+
+    tasks: list[Result]
+    next_page_token: str | None
+    total_size: int = 0
     trace: list[dict[str, Any]] = field(default_factory=list)
 
 

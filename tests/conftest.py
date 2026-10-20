@@ -55,6 +55,7 @@ from starlette.applications import Starlette
 
 API_KEY = "k-test-0123456789"
 FOREVER_TICKS = 400
+TICKS = 5
 SIGNING_KEY = "s" * 32
 
 
@@ -84,9 +85,10 @@ class EchoExecutor(AgentExecutor):
     """Echo agent; some inputs pick a behavior.
 
     ``fail`` → FAILED; ``ask``/``confirm`` → INPUT_REQUIRED; ``data`` → data artifact;
-    ``multi`` → three artifacts in order; ``forever`` → WORKING ticks (bounded at
-    ``FOREVER_TICKS`` so the session server never spins for good); ``big`` → many 1000-byte
-    artifacts; ``huge`` → one 6000-byte artifact; anything else → ``echo:<text>``.
+    ``multi`` → three artifacts in order; ``tick`` → ``TICKS`` artifacts 0.1 s apart, then
+    COMPLETED; ``forever`` → WORKING ticks (bounded at ``FOREVER_TICKS`` so the session
+    server never spins for good); ``big`` → many 1000-byte artifacts; ``huge`` → one
+    6000-byte artifact; anything else → ``echo:<text>``.
     """
 
     def __init__(self, server: RefServer):
@@ -128,6 +130,12 @@ class EchoExecutor(AgentExecutor):
                     TaskState.TASK_STATE_WORKING, up.new_agent_message([new_text_part(f"t{i}")])
                 )
                 await asyncio.sleep(0.01)
+            await up.complete()
+            return
+        if text == "tick":  # a short task that is still running for a moment
+            for i in range(TICKS):
+                await asyncio.sleep(0.1)
+                await up.add_artifact([new_text_part(f"t{i}")], name=f"t{i}")
             await up.complete()
             return
         if text == "multi":

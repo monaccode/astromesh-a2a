@@ -55,6 +55,8 @@ class Recorder:
             return Outgoing(needs_confirmation="A human must confirm this transfer")
         if incoming.text == "slow":
             await asyncio.sleep(5)
+        if incoming.text == "brief":
+            await asyncio.sleep(0.3)
         if incoming.text == "data":
             return Outgoing(answer="here", data=[{"temp": 21}])
         return Outgoing(answer=f"got:{incoming.text}", data=incoming.data)
@@ -566,3 +568,95 @@ def test_lifespan_cierra_handler_y_task_store(key_env, monkeypatch):
         assert closed == []
     assert closed == [True]
     assert task_id in saved  # our store was used
+
+
+# ---- task API: submit / get / list / subscribe, scoped per caller ------------------------
+
+
+async def _done(agent: RemoteAgent, task_id: str) -> Any:
+    deadline = time.monotonic() + 10
+    while True:
+        result = await agent.get_task(task_id)
+        if result.status not in ("submitted", "working"):
+            return result
+        assert time.monotonic() < deadline, "task never finished"
+        await asyncio.sleep(0.05)
+
+
+async def test_submit_y_api_de_tareas_contra_create_app(live, loopback):
+    """returnImmediately: the handler keeps running in the server after submit() returns."""
+    base, recorder = live
+    async with RemoteAgent(base, policy=_policy(), auth=Auth.api_key(ENV)) as agent:
+        await agent.card()  # so the timing below is the submit alone
+        started = time.monotonic()
+        submitted = await agent.submit("brief")
+        took = time.monotonic() - started
+        async with agent.subscribe(submitted.task_id) as events:
+            seen = [e async for e in events]
+        done = await agent.get_task(submitted.task_id)
+        page = await agent.list_tasks(context_id=submitted.context_id)
+        quick = await agent.submit("hi")
+        quick = await _done(agent, quick.task_id)
+    assert submitted.status in ("submitted", "working")
+    assert took < 0.3  # did not wait for the handler's 0.3 s
+    assert seen[-1].payload["state"] == "completed"
+    assert any(e.kind == "artifact" and e.payload["text"] == "got:brief" for e in seen)
+    assert (done.status, done.answer) == ("completed", "got:brief")
+    assert [r.task_id for r in page.tasks] == [submitted.task_id]
+    assert quick.answer == "got:hi"
+    assert [i.text for i in recorder.seen] == ["brief", "hi"]
+
+
+async def test_submit_respeta_handler_timeout(key_env):
+    recorder = Recorder()
+    build = lambda base: create_app(  # noqa: E731
+        recorder, _card(base), auth=api_key_auth(ENV), handler_timeout=0.2
+    )
+    with _live(build) as base:
+        agent = RemoteAgent(base, policy=_policy(), auth=Auth.api_key(ENV))
+        from astromesh_a2a.testing import allow_loopback
+
+        allow_loopback(agent)
+        async with agent:
+            submitted = await agent.submit("slow")
+            started = time.monotonic()
+            done = await _done(agent, submitted.task_id)
+    assert time.monotonic() - started < 3
+    assert (done.status, done.answer) == ("failed", FAILED_TEXT)
+
+
+async def test_otro_caller_no_ve_lista_ni_sigue_la_tarea_ajena(loopback):
+    """GetTask, ListTasks and SubscribeToTask are scoped by the identity auth returned."""
+
+    async def auth(request):
+        return request.headers.get("x-who") or False
+
+    recorder = Recorder()
+    with _live(lambda base: create_app(recorder, _card(base), auth=auth)) as base:
+
+        def agent(who: str) -> RemoteAgent:
+            return RemoteAgent(
+                base, policy=_policy(), auth=Auth.from_callable(lambda: who, "x-who")
+            )
+
+        async with agent("alice") as alice, agent("bob") as bob:
+            running = await alice.submit("brief")
+            waiting = await alice.send("transfer")
+            for task_id in (running.task_id, waiting.task_id):
+                with pytest.raises(TaskFailed) as exc:
+                    await bob.get_task(task_id)
+                assert exc.value.remote is True
+                with pytest.raises(TaskFailed):
+                    async with bob.subscribe(task_id) as events:
+                        _ = [e async for e in events]
+            bob_page = await bob.list_tasks()
+            bob_ctx = await bob.list_tasks(context_id=waiting.context_id)
+            alice_page = await alice.list_tasks()
+            mine = await alice.get_task(waiting.task_id)
+            await _done(alice, running.task_id)
+    assert bob_page.tasks == []
+    assert bob_page.total_size == 0
+    assert bob_ctx.tasks == []
+    assert {r.task_id for r in alice_page.tasks} == {running.task_id, waiting.task_id}
+    assert mine.status == "input_required"
+    assert {i.caller for i in recorder.seen} == {"alice"}
