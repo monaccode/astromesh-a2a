@@ -261,11 +261,15 @@ class RemoteTool:
         self.context_id: str | None = None
         self.last_result: Result | None = None  # the last successful call's Result
         self._lock: asyncio.Lock | None = None  # created on first call, in the agent's loop
+        # Sync callers queue HERE, before dispatch: a caller waiting for another call to
+        # finish must not spend its own dispatch timeout (run_sync) while it waits.
+        self._sync_lock = threading.Lock()
 
     @classmethod
     def for_agent(cls, agent: Any, name: str | None, description: str | None) -> RemoteTool:
         """Name/description default from the agent's cached card (``await agent.card()``
-        first), else both must be given. No I/O here."""
+        first), else both must be given. The name, the card's or ``name=``, is always
+        sanitized with ``tool_name``. No I/O here."""
         for label, value in (("name", name), ("description", description)):
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"{label} must be a non-empty str")
@@ -279,7 +283,7 @@ class RemoteTool:
         card_name = (card.name if card is not None else "") or "remote"
         return cls(
             agent,
-            name=name or tool_name(card_name),
+            name=tool_name(name if name is not None else card_name),
             description=description or tool_description(card_name, card.description),
             agent_name=_one_line(card_name, _NAME_MAX),
         )
@@ -321,5 +325,10 @@ class RemoteTool:
         return wrap_untrusted(result, agent=self.agent_name)
 
     def call(self, query: str) -> str:
-        """``acall`` from sync code, through ``run_sync`` on the agent's loop."""
-        return run_sync(self.acall(query), agent=self.agent)
+        """``acall`` from sync code, through ``run_sync`` on the agent's loop.
+
+        Concurrent sync calls on one tool wait for each other BEFORE dispatch, so the
+        dispatch timeout of each covers only its own call.
+        """
+        with self._sync_lock:
+            return run_sync(self.acall(query), agent=self.agent)

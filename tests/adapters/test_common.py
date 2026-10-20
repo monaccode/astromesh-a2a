@@ -1,6 +1,8 @@
 import asyncio
 import importlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from _fake import INJECTION, FakeAgent, asking, done
@@ -105,6 +107,39 @@ def test_defaults_need_card_or_both_values():
     assert (tool.name, tool.description) == ("x", "y")
     with pytest.raises(ValueError, match="name must be a non-empty str"):
         RemoteTool.for_agent(FakeAgent(), " ", None)
+
+
+def test_custom_name_is_sanitized_like_the_card_name():
+    tool = RemoteTool.for_agent(FakeAgent(), "Ask the Bank!", "Ask it.")
+    assert tool.name == "ask_the_bank"
+    assert RemoteTool.for_agent(FakeAgent(), "class", "d").name == "class_agent"
+    assert RemoteTool.for_agent(FakeAgent(), "9 lives", "d").name == "a2a_9_lives"
+    assert len(RemoteTool.for_agent(FakeAgent(), "y" * 200, "d").name) == 64
+    assert as_tool(FakeAgent(), "mcp", name="Ask Bank").name == "ask_bank"
+
+
+class _SlowSyncAgent(FakeAgent):
+    """Each call takes 0.25 s; the dispatch timeout (policy.timeout + grace) is 0.4 s."""
+
+    policy = SimpleNamespace(timeout=0.4)
+
+    async def send(self, text, *, context_id=None):
+        await asyncio.sleep(0.25)
+        return await super().send(text, context_id=context_id)
+
+
+def test_queued_sync_callers_wait_outside_the_dispatch_timer(monkeypatch):
+    from astromesh_a2a.adapters import _common
+
+    monkeypatch.setattr(_common, "_DISPATCH_GRACE", 0.0)
+    agent = _SlowSyncAgent(done("a"), done("b"), done("c"))
+    tool = RemoteTool.for_agent(agent, None, None)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        # Serialized: the last one waits ~0.5 s for the others, longer than 0.4 s. Each
+        # dispatch timer must only cover its own 0.25 s call, so none of them times out.
+        results = list(pool.map(tool.call, ["1", "2", "3"]))
+    assert all("remote-agent-output" in r for r in results)
+    assert sorted(c[1] for c in agent.calls) == ["1", "2", "3"]
 
 
 def test_unknown_framework():
