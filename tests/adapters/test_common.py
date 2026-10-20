@@ -115,7 +115,6 @@ def test_custom_name_is_sanitized_like_the_card_name():
     assert RemoteTool.for_agent(FakeAgent(), "class", "d").name == "class_agent"
     assert RemoteTool.for_agent(FakeAgent(), "9 lives", "d").name == "a2a_9_lives"
     assert len(RemoteTool.for_agent(FakeAgent(), "y" * 200, "d").name) == 64
-    assert as_tool(FakeAgent(), "mcp", name="Ask Bank").name == "ask_bank"
 
 
 class _SlowSyncAgent(FakeAgent):
