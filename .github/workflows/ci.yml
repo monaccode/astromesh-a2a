@@ -22,6 +22,14 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --python ${{ matrix.python }}
       - run: uv run --python ${{ matrix.python }} pytest -q
+  eval:
+    # Attack eval: fails unless the default policy stops every trap (docs/eval.md).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run python -m astromesh_a2a.eval
   adapters:
     # Framework adapters: every extra installed (the core matrix skips these tests).
     runs-on: ubuntu-latest

@@ -86,6 +86,14 @@
   text, `{"messages": [...]}` for graphs, the single required field, or `{"input": ...}`),
   `configurable.thread_id` is `Incoming.session_key`; messages, `{"messages": ...}` and
   `{"output": ...}` results become the answer, other dicts become `data`.
+- Attack eval (`astromesh_a2a.eval`): nine local malicious remotes (`card_spoof`,
+  `redirect_internal`, `dns_private`, `huge_artifact`, `file_part`, `injection_text`,
+  `self_confirm`, `endless_stream`, `version_0_3`), each with a precise "stopped" rule
+  that counts the requests the server received. `await run_traps(policy)` returns an
+  `EvalReport(total, stopped, by_trap, details)`; `python -m astromesh_a2a.eval` prints
+  the table and exits non-zero unless every trap is stopped. The harness opts only its
+  own agents into loopback. The default policy stops 9/9; CI gains an `eval` job.
+  See `docs/eval.md`.
 
 ### Changed
 
