@@ -38,7 +38,7 @@ servidor de otro; esta librería es la capa entre él y tu agente.
 | El texto del remoto le dice a tu modelo "ignorá las instrucciones anteriores" | **Salida no confiable envuelta.** Las tools devuelven las palabras del remoto dentro de `<remote-agent-output untrusted="true" ...>`, con `<`, `>`, `&` y comillas escapados para que el bloque no se pueda cerrar ni falsificar. |
 | El remoto pide "respondé sí para confirmar la transferencia" | **Nunca autoconfirma.** Una tarea `input_required` vuelve como pregunta pendiente; sólo un `reply()` explícito (del usuario, a través de tu agente) la continúa. El servidor marca todo mensaje entrante como `Origin.AGENT` y no confiable. |
 | Un artefacto de 2 GB, un stream que nunca termina, un remoto que te come el presupuesto | **Presupuestos, timeouts y topes de tamaño.** `max_bytes` por cuerpo y parte, `max_stream_bytes` por stream, `timeout` por llamada (reloj de pared), `max_events` por stream, `Budget(max_calls, max_seconds)` por remoto. Las partes de archivo se descartan salvo que las aceptes. |
-| No ves qué pasó, o tus logs filtran la API key | **Traza por etapa con redacción.** Cada llamada devuelve una traza (`card`, `send`, `status`, `artifact`, `rejection`, `result`) con claves, tokens, credenciales en URLs y firmas de URLs prefirmadas tachadas, y un `traceparent` W3C. Las credenciales salen sólo de variables de entorno o callables. |
+| No ves qué pasó, o tus logs filtran la API key | **Traza por etapa con redacción.** Cada llamada devuelve una traza (`card`, `send`, `status`, `artifact`, `message`, `rejection`, `result`) con claves, tokens, credenciales en URLs y firmas de URLs prefirmadas tachadas, y un `traceparent` W3C. Las credenciales salen sólo de variables de entorno o callables. |
 
 No son promesas: un [eval de ataques](https://github.com/monaccode/astromesh-a2a/blob/main/docs/eval.md)
 corre nueve remotos maliciosos contra la librería en cada push.
@@ -94,8 +94,14 @@ servidor. Guía: [docs/server.md](https://github.com/monaccode/astromesh-a2a/blo
 Probá las dos puntas en tu máquina, sin red:
 
 ```bash
+git clone https://github.com/monaccode/astromesh-a2a && cd astromesh-a2a
 uv run python examples/hello_local.py
 ```
+
+Se corre desde un checkout (los ejemplos no van en el wheel). La guardia de salida
+rechaza `127.0.0.1`, así que el ejemplo habilita loopback sólo para su propio agente con
+`astromesh_a2a.testing.allow_loopback(agent)`: sólo para desarrollo local y tests, nunca
+en producción ([docs/policy.md](https://github.com/monaccode/astromesh-a2a/blob/main/docs/policy.md#loopback-local-development-and-tests-only)).
 
 ## Un agente remoto como tool de tu framework
 

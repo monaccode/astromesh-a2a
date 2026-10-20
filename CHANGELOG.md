@@ -1,6 +1,14 @@
 # Changelog
 
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/).
+
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-20
+
+First release.
 
 ### Added
 
@@ -8,114 +16,76 @@
   public hosts; each host is resolved once and the connection pinned to the checked IP
   (no DNS-rebinding window); no redirects; decoded response bodies capped; guard
   failures raise `BlockedDestination`.
-- `Policy`: allow-list of hosts/card URLs (nothing allowed by default), accepted part
-  kinds, byte/time/event caps, budgets (`Budget`, `BudgetMeter`), optional card
-  signatures with keys pinned by `kid` (`signing_keys`, `signing_algorithms`).
-- Typed errors: `A2AError`, `PolicyRejected`, `BlockedDestination`, `TaskFailed`,
-  `A2ATimeout`, `UnsupportedVersion`, `ConfirmationRequired`.
+- `Policy`: allow-list of hosts/card URLs (nothing allowed by default; URLs with user
+  info refused), accepted part kinds, byte/time/event caps, budgets (`Budget`, with
+  `BudgetMeter.admit()`/`remaining_seconds()`/`record_seconds()`), optional card
+  signatures with keys pinned by `kid` (`signing_keys`, `signing_algorithms`; `signing`
+  extra, PyJWT), `max_stream_bytes` (default 8 MiB) and `card_ttl` (default 300 s: the
+  card is fetched and vetted again after it expires; a refresh that fails the checks
+  leaves no stale card behind).
+- Typed errors: `A2AError`, `PolicyRejected`, `BlockedDestination`, `TaskFailed`
+  (`remote=True` only when the remote itself reported the task ended), `A2ATimeout`,
+  `UnsupportedVersion`; local `RuntimeError`s `LoopBindingError` and `AgentClosedError`,
+  never translated.
 - `Trace`: per-stage trace with secret redaction (keys, URL userinfo, query parameters
   incl. presigned-URL signatures/credentials, Bearer/Basic values) and W3C `traceparent`.
-- `RemoteAgent`: card discovery and blocking `send()` on the official `a2a-sdk`. The card
-  is fetched and vetted by us (policy host, signature, A2A 1.x JSON-RPC interface only,
-  interface host allowed) before any SDK client exists; whole call under the policy
-  timeout; origin and `traceparent` in the message metadata; parts the policy does not
-  accept are dropped and traced. `Result`, `Origin` and `Auth` (env vars or callables).
-- `signing` extra (`PyJWT`) for card signature verification.
-- `RemoteAgent.stream()`: SSE events as `Event(kind, payload)` (`status`/`artifact`/
-  `message`, plain dicts marked `untrusted`), in order, through an `EventStream` with its
-  own trace; capped by `policy.timeout` (whole stream) and `policy.max_events`
-  (`A2ATimeout`), stops after the first final status, closes the remote stream on
-  `async with` exit or `aclose()`. Parts the policy does not accept are dropped and
-  traced per event: status events are always emitted, artifact/message events with
-  nothing accepted are dropped, and `PolicyRejected` only if the task completes having
-  sent nothing acceptable. A closed `RemoteAgent` refuses streams created before closing.
-- `RemoteAgent.reply(task_id, text)` continues a task that asked for input, and
-  `RemoteAgent.cancel(task_id)`. A confirmation is never answered automatically: `send()`
-  returns `input_required` and `stream()` emits it and ends.
-- Budgets enforced per `RemoteAgent`: every `send`/`reply`/`stream`/`cancel` is admitted
-  before any request (card included) leaves; exhausted → `PolicyRejected("budget")`. A
-  seconds budget also caps each call's deadline. `BudgetMeter.admit()`,
-  `remaining_seconds()`, `record_seconds()`.
-- `Policy.max_stream_bytes` (default 8 MiB): an SSE response is capped in total at this
-  and per event at `max_bytes` (in `net.PinnedTransport`); other bodies keep `max_bytes`.
-- `Policy.card_ttl` (default 300 s): the card is fetched and vetted again after it
-  expires; a refresh that fails the checks leaves no stale card behind.
-- Server: `create_app(handler, card, auth=...)` (Starlette, mountable) and `serve(...)`
-  (uvicorn; `server` extra, imported lazily) expose any async agent as an A2A agent on the
-  official SDK: card at `/.well-known/agent-card.json` built from `CardSpec`/`Skill`,
-  JSON-RPC 1.0 (blocking and SSE) at `/a2a`. Auth is mandatory: the `auth` callable
-  (`api_key_auth(env, header)`, constant-time, fail closed when the env var is unset, or any
-  `async (Request) -> bool | str`) runs before the SDK and refuses with `401` JSON; without
-  it `create_app`/`serve` raise `ValueError` unless `insecure=True`. Request bodies over
-  `max_body_bytes` (default 1 MiB) answer `413`. Only `A2A-Version: 1.x` is served (missing
-  header = 0.3 → `-32009`).
+- `RemoteAgent` on the official `a2a-sdk`: the card is fetched and vetted by the library
+  (policy host, signature, A2A 1.x JSON-RPC interface only, interface host allowed)
+  before any SDK client exists; `card()` returns a frozen `RemoteCard` (`name`,
+  `description`, `version`, `interface_url`, `protocol_version`, `streaming`,
+  `has_signatures`, `signature_verified`, `skills`, `.raw`). `send()`, `reply(task_id,
+  text)`, `cancel(task_id)` and `stream()` (an `EventStream` of `Event(kind, payload)`
+  with its own trace) each run under the policy timeout; streams are also capped by
+  `max_events` and closed on `async with` exit or `aclose()`. Origin and `traceparent`
+  go in the message metadata. Parts the policy does not accept are dropped and traced;
+  `PolicyRejected` only when nothing acceptable came back. A confirmation is never
+  answered automatically: `send()` returns `input_required` with the question in
+  `Result.pending`, and only an explicit `reply()` continues the task. Every call is
+  admitted against the budget before any request (card included) leaves. Unexpected
+  SDK errors become a generic `TaskFailed` that never quotes the remote. An agent is
+  bound to the event loop of its first I/O and refuses others.
+- `Auth` (`bearer`, `api_key`, `from_callable`): secrets read at call time from env vars
+  or callables, never stored, traced or shown in a repr. Sent on the card fetch and on
+  every RPC, only to policy-allowed hosts.
+- `astromesh_a2a.testing.allow_loopback(agent)`: the explicit, per-agent opt-in to reach
+  loopback, for local development and tests only (never production); `Policy` has no
+  flag for it.
+- Server (`server` extra, imported lazily): `create_app(handler, card, auth=...)`
+  (Starlette, mountable) and `serve(...)` (uvicorn) expose any async agent as an A2A
+  agent: card at `/.well-known/agent-card.json` built from `CardSpec`/`Skill`, JSON-RPC
+  1.0 (blocking and SSE) at `/a2a`. Auth is mandatory (`api_key_auth(env, header)`,
+  constant-time and fail closed, or any `async (Request) -> bool | str`; `401` JSON on
+  refusal); without it `create_app`/`serve` raise `ValueError` unless `insecure=True`.
+  Bodies over `max_body_bytes` (default 1 MiB) answer `413`, a malformed
+  `Content-Length` `400`. Only `A2A-Version: 1.x` is served. Tasks are scoped by caller
+  identity; `task_store=` (default: the SDK's in-memory store) must keep that scoping.
+  `handler_timeout` (default 300 s) and handler exceptions fail the task with a generic
+  message.
 - `Incoming`/`Outgoing`: every incoming message reaches the handler as `Origin.AGENT`,
   `untrusted=True`, whatever the remote claims (`claimed_origin` kept for logging only);
-  file parts are dropped. `Outgoing.needs_confirmation` puts the task in `input_required`;
-  the remote's reply comes back as untrusted input and the library never marks anything
-  as confirmed. `Incoming.is_reply`/`pending` tell a reply to a waiting task (and the
-  question it waited on) from a new message; `Incoming.session_key`
-  (`"<caller>:<context_id>"`) is what to key memory by, since `context_id` is chosen by the
-  caller. A handler exception, or a handler running past `handler_timeout` (default
-  300 s), fails the task with a generic message; details stay in the local log.
-- `create_app`/`serve` take `task_store=` (default: the SDK's unbounded in-memory store);
-  the app's lifespan closes the SDK request handler on shutdown.
-- `RemoteAgent.as_tool(framework, *, name=None, description=None)` and
-  `astromesh_a2a.adapters`: a remote agent as a native tool of LangChain
-  (`StructuredTool`), CrewAI (`BaseTool`), Google ADK (`FunctionTool`), OpenAI Agents SDK
-  (`function_tool`) and PydanticAI (`Tool`); frameworks are imported on first use and a
-  missing one raises `MissingExtraError` naming the extra. One input, `query`; the tool
-  object keeps the conversation and replies to a task waiting for input (one tool per
-  conversation). The output is `wrap_untrusted()`: the remote's words inside
-  `<remote-agent-output untrusted="true" ...>` with `<`/`>`/`&` escaped, and for a
-  pending task its `task_id` plus a note that only the user may answer it. Errors use
-  each framework's tool-error convention with a safe message. Name and description
-  default to the cached card (the remote's description quoted as untrusted). A
-  `RemoteAgent` is bound to the event loop of its first I/O and refuses others; sync
-  calls (`run_sync`) are dispatched to that loop when it runs in another thread, run on
-  a background loop when the agent has none yet, and raise `LoopBindingError` when
-  it is closed; a sync call inside a running loop is refused. Calls on one tool are
-  serialized; `RemoteTool.last_result` keeps the last `Result`. PydanticAI retries
-  (`ModelRetry`) only on `A2ATimeout`; other errors are returned as the tool result.
-  CI gains an `adapters` job with every extra installed.
-- Adapters for LlamaIndex (`FunctionTool`, sync + async), smolagents (`Tool`), Microsoft
-  Agent Framework (`FunctionTool`) and MCP (a FastMCP `Tool`; `adapters.mcp.build_server`
-  serves it as a whole MCP server, failures as `isError` results).
-- `adapters.server_langchain.handler_from_runnable(runnable, *, input_key="auto")`: a
-  LangChain runnable as a `serve()` handler. Input follows the runnable's schema (the
-  text, `{"messages": [...]}` for graphs, the single required field, or `{"input": ...}`),
-  `configurable.thread_id` is `Incoming.session_key`; messages, `{"messages": ...}` and
-  `{"output": ...}` results become the answer, other dicts become `data`.
-- Attack eval (`astromesh_a2a.eval`): nine local malicious remotes (`card_spoof`,
-  `redirect_internal`, `dns_private`, `huge_artifact`, `file_part`, `injection_text`,
-  `self_confirm`, `endless_stream`, `version_0_3`), each with a precise "stopped" rule
-  that counts the requests the server received. `await run_traps(policy)` returns an
-  `EvalReport(total, stopped, by_trap, details)`; `python -m astromesh_a2a.eval` prints
-  the table and exits non-zero unless every trap is stopped. The harness opts only its
-  own agents into loopback. The default policy stops 9/9; CI gains an `eval` job.
-  See `docs/eval.md`.
-- Identity and documentation: logo set (`assets/logo-mark.svg`, `logo.png`, `icon.png`,
-  violet accent), README in English and Spanish, guides (`docs/client.md`, `server.md`,
-  `policy.md`, `frameworks.md`, `ecosystem.md`) and runnable examples
-  (`examples/hello_local.py` serves and calls an agent offline, `langchain_tool.py`,
-  `serve_langchain.py`). `tests/test_examples.py` runs `hello_local.py`, and the release
-  smoke runs it against the package installed from TestPyPI.
+  file parts are dropped. `Outgoing.needs_confirmation` puts the task in
+  `input_required`; the remote's reply comes back as untrusted input with `is_reply` and
+  `pending`, and the library never marks anything as confirmed. `Incoming.session_key`
+  (`"<caller>:<context_id>"`) is what to key memory by.
+- `RemoteAgent.as_tool(framework)` and `astromesh_a2a.adapters`: a remote agent as a
+  native tool of LangChain, CrewAI, Google ADK, OpenAI Agents SDK, PydanticAI,
+  LlamaIndex, smolagents, Microsoft Agent Framework and MCP (FastMCP; `build_server`
+  serves it as a whole MCP server). One `query` input; the tool keeps one conversation
+  and replies to a task waiting for input; output wrapped by `wrap_untrusted()` with a
+  note that only the user may answer a pending question; errors use each framework's
+  convention with a safe message; names (from the card or `name=`) sanitized for every
+  framework. Sync calls are dispatched to the agent's loop (`run_sync`) and queued per
+  tool before dispatch. `MissingExtraError` names the extra to install.
+- `adapters.server_langchain.handler_from_runnable(runnable)`: a LangChain runnable as a
+  `serve()` handler.
+- Attack eval (`astromesh_a2a.eval`, `python -m astromesh_a2a.eval`): nine local
+  malicious remotes (`card_spoof`, `redirect_internal`, `dns_private`, `huge_artifact`,
+  `file_part`, `injection_text`, `self_confirm`, `endless_stream`, `version_0_3`), each
+  with a precise "stopped" rule; the default policy stops 9/9 and CI enforces it.
+- Documentation (README in English and Spanish, guides under `docs/`), logo, runnable
+  examples (`examples/hello_local.py` serves and calls an agent offline), CI (lint, core
+  matrix 3.10-3.13, eval, adapters with every extra) and a release workflow (TestPyPI,
+  smoke install from the wheel's metadata, PyPI and GitHub Release on a `v*` tag).
 
-### Changed
-
-- `RemoteAgent` is bound to the event loop of its first I/O; use from another loop raises
-  `LoopBindingError` (a local `RuntimeError`, never translated). Any other unexpected
-  exception during an RPC (e.g. an SDK bug on a malformed response) is still a generic
-  `TaskFailed` that never quotes the remote. `TaskFailed.remote` is `True` only when the
-  remote itself reported the task ended, including the remote's task-not-found /
-  unsupported-operation / not-cancelable errors. Adapters drop a pending task on any
-  `TaskFailed` (never stuck replying to a dead task) and keep it on timeouts and policy
-  rejections. `aclose()` from another live loop raises `LoopBindingError`. A sync
-  dispatch to a running but blocked agent loop gives up after `policy.timeout` + 5 s
-  with `LoopBindingError` instead of hanging.
-
-- **Breaking:** `RemoteAgent.card()` returns a frozen `RemoteCard` (`name`, `description`,
-  `version`, `interface_url`, `protocol_version`, `streaming`, `has_signatures`,
-  `signature_verified`, `skills` as `Skill`s) instead of the SDK protobuf `AgentCard`;
-  `signature_verified` is `True` only when the policy required a signature and it
-  verified. `RemoteCard.raw` keeps a copy of the vetted protobuf.
+[Unreleased]: https://github.com/monaccode/astromesh-a2a/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/monaccode/astromesh-a2a/releases/tag/v0.1.0

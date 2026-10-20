@@ -37,7 +37,7 @@ program on someone else's server; this library is the layer between it and your 
 | The remote's text tells your model "ignore previous instructions" | **Untrusted output wrapping.** Framework tools return the remote's words inside `<remote-agent-output untrusted="true" ...>`, with `<`, `>`, `&` and quotes escaped so the block cannot be closed or forged. |
 | The remote asks "reply yes to confirm the transfer" | **Never auto-confirm.** An `input_required` task comes back as a pending question; only an explicit `reply()` (from the user, through your agent) continues it. The server marks every incoming message `Origin.AGENT` and untrusted. |
 | A 2 GB artifact, a stream that never ends, a remote that eats your budget | **Budgets, timeouts and size caps.** `max_bytes` per body and part, `max_stream_bytes` per stream, `timeout` per call (wall-clock), `max_events` per stream, `Budget(max_calls, max_seconds)` per remote. File parts are dropped unless you accept them. |
-| You cannot see what happened, or your logs leak the API key | **Per-stage trace with redaction.** Every call returns a trace (`card`, `send`, `status`, `artifact`, `rejection`, `result`) with keys, tokens, URL credentials and presigned-URL signatures redacted, and a W3C `traceparent`. Credentials come only from env vars or callables. |
+| You cannot see what happened, or your logs leak the API key | **Per-stage trace with redaction.** Every call returns a trace (`card`, `send`, `status`, `artifact`, `message`, `rejection`, `result`) with keys, tokens, URL credentials and presigned-URL signatures redacted, and a W3C `traceparent`. Credentials come only from env vars or callables. |
 
 These are not claims: an [attack eval](https://github.com/monaccode/astromesh-a2a/blob/main/docs/eval.md)
 runs nine malicious remotes against the library on every push.
@@ -93,8 +93,14 @@ Guide: [docs/server.md](https://github.com/monaccode/astromesh-a2a/blob/main/doc
 Try both ends on your machine, offline:
 
 ```bash
+git clone https://github.com/monaccode/astromesh-a2a && cd astromesh-a2a
 uv run python examples/hello_local.py
 ```
+
+It runs from a checkout (examples are not in the wheel). The egress guard refuses
+`127.0.0.1`, so the example opts its own agent into loopback with
+`astromesh_a2a.testing.allow_loopback(agent)`: local development and tests only, never
+production ([docs/policy.md](https://github.com/monaccode/astromesh-a2a/blob/main/docs/policy.md#loopback-local-development-and-tests-only)).
 
 ## A remote agent as a tool of your framework
 

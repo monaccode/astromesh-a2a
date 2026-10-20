@@ -29,8 +29,10 @@ await trips.card()  # name and description come from the card, or pass name=/des
   the model that only the user can answer the remote's question.
 - **Errors** follow each framework's tool-error convention with a short, safe message (no
   stack, no credentials). `RemoteTool.last_result` keeps the last `Result`.
-- **Name and description** default to the card: the name is sanitized for every framework,
-  the remote's description is quoted as untrusted under the library's own framing.
+- **Name and description** default to the card. The name (from the card, or your own
+  `name=`) is sanitized for every framework (`[a-z0-9_]`, a Python identifier, at most 64
+  characters); the remote's description is quoted as untrusted under the library's own
+  framing.
 
 | Framework | Returns | Tool errors |
 |---|---|---|
@@ -129,8 +131,11 @@ response = await planner.run("A flight to Lima on Friday")
 `pip install 'astromesh-a2a[smolagents]'`
 
 ```python
+import asyncio
+
 from smolagents import InferenceClientModel, ToolCallingAgent
 
+# `trips` as above (card already loaded). InferenceClientModel reads HF_TOKEN.
 planner = ToolCallingAgent(tools=[trips.as_tool("smolagents")], model=InferenceClientModel())
 answer = await asyncio.to_thread(planner.run, "A flight to Lima on Friday")
 ```
