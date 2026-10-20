@@ -94,6 +94,12 @@
   the table and exits non-zero unless every trap is stopped. The harness opts only its
   own agents into loopback. The default policy stops 9/9; CI gains an `eval` job.
   See `docs/eval.md`.
+- Identity and documentation: logo set (`assets/logo-mark.svg`, `logo.png`, `icon.png`,
+  violet accent), README in English and Spanish, guides (`docs/client.md`, `server.md`,
+  `policy.md`, `frameworks.md`, `ecosystem.md`) and runnable examples
+  (`examples/hello_local.py` serves and calls an agent offline, `langchain_tool.py`,
+  `serve_langchain.py`). `tests/test_examples.py` runs `hello_local.py`, and the release
+  smoke runs it against the package installed from TestPyPI.
 
 ### Changed
 
