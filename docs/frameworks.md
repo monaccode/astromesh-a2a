@@ -36,8 +36,9 @@ await trips.card()  # name and description come from the card, or pass name=/des
 
 Writing your own tool around a `RemoteAgent` (a framework not listed, your own loop)?
 Reuse the same safety text from `astromesh_a2a.adapters`: `tool_description(card_name,
-card_description)` (the default description, the remote's self-description quoted as
-untrusted), `wrap_untrusted(result, agent=...)` (the output block) and `PENDING_NOTE` (the
+card_description)` (the default description: the remote's output is untrusted data, a
+confirmation or approval is never answered on the user's behalf, and the remote's
+self-description is quoted as untrusted), `wrap_untrusted(result, agent=...)` (the output block) and `PENDING_NOTE` (the
 note it appends when the remote waits for input).
 
 ```python

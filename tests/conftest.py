@@ -86,7 +86,7 @@ class EchoExecutor(AgentExecutor):
 
     ``fail`` → FAILED; ``ask``/``confirm`` → INPUT_REQUIRED; ``data`` → data artifact;
     ``multi`` → three artifacts in order; ``tick`` → ``TICKS`` artifacts 0.1 s apart, then
-    COMPLETED; ``forever`` → WORKING ticks (bounded at ``FOREVER_TICKS`` so the session
+    COMPLETED; ``bigslow`` → like ``big`` after 0.3 s; ``forever`` → WORKING ticks (bounded at ``FOREVER_TICKS`` so the session
     server never spins for good); ``big`` → many 1000-byte artifacts; ``huge`` → one
     6000-byte artifact; anything else → ``echo:<text>``.
     """
@@ -136,6 +136,12 @@ class EchoExecutor(AgentExecutor):
             for i in range(TICKS):
                 await asyncio.sleep(0.1)
                 await up.add_artifact([new_text_part(f"t{i}")], name=f"t{i}")
+            await up.complete()
+            return
+        if text == "bigslow":  # still running when subscribed, then 12 KB of artifacts
+            await asyncio.sleep(0.3)
+            for _ in range(12):
+                await up.add_artifact([new_text_part("x" * 1000)], name="chunk")
             await up.complete()
             return
         if text == "multi":

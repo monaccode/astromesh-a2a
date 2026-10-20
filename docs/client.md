@@ -151,8 +151,14 @@ The same guards apply to every call: the budget admits it first, `policy.timeout
 errors. An unknown task, or one owned by another caller, raises `TaskFailed(remote=True)`.
 `subscribe()` to a task that already ended raises it too (use `get_task()`), and needs a
 remote whose card declares streaming. In `list_tasks()`, a task whose parts were all of
-a refused kind is listed with them dropped (traced) instead of failing the whole page;
-the page is one response body, so `max_bytes` caps it: keep pages small.
+a refused kind is listed with them dropped (traced) instead of failing the whole page, a
+task in an unknown state is left out (traced), and listing never touches the contexts
+`reply()` remembers; the page is one response body, so `max_bytes` caps it: keep pages
+small.
+
+Every id the client sends (`task_id`, `context_id`, `page_token`) must be a str of at most
+256 characters without control characters; anything else is a `ValueError` before any
+request (`context_id=""` still means "none" for `send()`, `stream()` and `submit()`).
 
 A server built with `create_app` supports all four (see [server.md](server.md#tasks)).
 

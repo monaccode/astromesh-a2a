@@ -44,6 +44,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import re
 import sys
 import time
 import uuid
@@ -115,6 +116,9 @@ _WAITING_STATES = frozenset(
     {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
 )
 _RUNNING_STATES = frozenset({TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING})
+_KNOWN_STATES = frozenset(
+    {TaskState.TASK_STATE_COMPLETED, *_FAILED_STATES, *_WAITING_STATES, *_RUNNING_STATES}
+)
 # list_tasks(status=...): our lower-case names of the A2A task states.
 _STATUS_FILTER = {
     TaskState.Name(state).removeprefix("TASK_STATE_").lower(): state
@@ -126,6 +130,8 @@ _STATUS_FILTER = {
     )
 }
 _MAX_PAGE_SIZE = 100  # the A2A/SDK cap for ListTasks
+_MAX_ID = 256  # task ids, context ids and page tokens we send
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 _T = TypeVar("_T")
 
 
@@ -242,14 +248,25 @@ def _state_name(state: int) -> str:
     return TaskState.Name(state).removeprefix("TASK_STATE_").lower()
 
 
-def _check_task_id(task_id: Any) -> None:
-    if not isinstance(task_id, str) or not task_id:
-        raise ValueError("task_id must be a non-empty str")
+def _check_id(name: str, value: Any, *, optional: bool = False, empty: bool = False) -> None:
+    """An id we send (task, context, page token): a str of at most ``_MAX_ID`` chars,
+    no control characters. ``ValueError`` before anything is sent.
 
-
-def _check_optional_str(name: str, value: Any) -> None:
-    if value is not None and (not isinstance(value, str) or not value):
-        raise ValueError(f"{name} must be a non-empty str or None")
+    ``optional``: ``None`` is fine. ``empty``: ``""`` is fine (means "none", as
+    ``send(context_id="")`` always did).
+    """
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a str" + (" or None" if optional else ""))
+    if not value:
+        if empty:
+            return
+        raise ValueError(f"{name} must not be empty")
+    if len(value) > _MAX_ID:
+        raise ValueError(f"{name} is longer than {_MAX_ID} characters")
+    if _CONTROL_CHARS.search(value):
+        raise ValueError(f"{name} must not contain control characters")
 
 
 class EventStream:
@@ -504,6 +521,7 @@ class RemoteAgent:
         ``pending``; only an explicit ``reply()`` continues the task.
         """
         self._check_open()
+        _check_id("context_id", context_id, optional=True, empty=True)
         data = _json_data(data)
         trace = Trace()
         final = await self._guarded(
@@ -522,8 +540,8 @@ class RemoteAgent:
         the task came from elsewhere (another ``RemoteAgent``, a restart, a store).
         """
         self._check_open()
-        _check_task_id(task_id)
-        _check_optional_str("context_id", context_id)
+        _check_id("task_id", task_id)
+        _check_id("context_id", context_id, optional=True)
         trace = Trace()
         if context_id is None:
             context_id = self._contexts.get(task_id)
@@ -541,7 +559,7 @@ class RemoteAgent:
         ``TaskFailed`` if the task already ended in another final state.
         """
         self._check_open()
-        _check_task_id(task_id)
+        _check_id("task_id", task_id)
         trace = Trace()
         task = await self._guarded(lambda: self._cancel(task_id, trace), trace)
         state = task.status.state
@@ -572,6 +590,7 @@ class RemoteAgent:
         garbage collector.
         """
         self._check_open()
+        _check_id("context_id", context_id, optional=True, empty=True)
         trace = Trace()
 
         def open_events() -> Any:
@@ -602,6 +621,7 @@ class RemoteAgent:
         ended badly is a status here (``failed``...), not an error.
         """
         self._check_open()
+        _check_id("context_id", context_id, optional=True, empty=True)
         data = _json_data(data)
         trace = Trace()
         final = await self._guarded(
@@ -620,7 +640,7 @@ class RemoteAgent:
         raises ``TaskFailed(remote=True)``.
         """
         self._check_open()
-        _check_task_id(task_id)
+        _check_id("task_id", task_id)
         trace = Trace()
 
         async def run() -> Task:
@@ -651,8 +671,8 @@ class RemoteAgent:
         one response body, capped by ``policy.max_bytes``: keep pages small.
         """
         self._check_open()
-        _check_optional_str("context_id", context_id)
-        _check_optional_str("page_token", page_token)
+        _check_id("context_id", context_id, optional=True)
+        _check_id("page_token", page_token, optional=True)
         if status is not None and status not in _STATUS_FILTER:
             raise ValueError(f"status must be one of {sorted(_STATUS_FILTER)} or None")
         if page_size is not None and (
@@ -679,9 +699,15 @@ class RemoteAgent:
             return await self._sdk_client(streaming=False).list_tasks(request, context=context)
 
         page = await self._guarded(run, trace)
-        tasks = [self._task_result(t, trace, strict=False) for t in page.tasks]
-        for result in tasks:
+        tasks: list[Result] = []
+        for task in page.tasks:
+            if task.status.state not in _KNOWN_STATES:  # one bad task never sinks the page
+                trace.add("rejection", task_id=task.id or None, reason="unknown_state")
+                continue
+            # Listing does not feed reply()'s context map: it could evict pending tasks.
+            result = self._task_result(task, trace, strict=False, remember=False)
             result.trace = []
+            tasks.append(result)
         return TaskPage(
             tasks=tasks,
             next_page_token=page.next_page_token or None,
@@ -701,7 +727,7 @@ class RemoteAgent:
         is read.
         """
         self._check_open()
-        _check_task_id(task_id)
+        _check_id("task_id", task_id)
         trace = Trace()
 
         def open_events() -> Any:
@@ -1024,7 +1050,9 @@ class RemoteAgent:
         detail = f": {_remote_text(status_text)}" if status_text else ""
         raise TaskFailed(f"remote task {name}{detail}", remote=True)
 
-    def _task_result(self, task: Task, trace: Trace, *, strict: bool) -> Result:
+    def _task_result(
+        self, task: Task, trace: Trace, *, strict: bool, remember: bool = True
+    ) -> Result:
         """A task as it is, in any state (the task API).
 
         ``strict``: parts all of a refused kind raise ``PolicyRejected`` where ``send()``
@@ -1050,7 +1078,9 @@ class RemoteAgent:
             pending = None
         else:
             raise TaskFailed(f"remote task in unknown state {_remote_text(name)}", remote=True)
-        return self._finish(trace, name, answer, data, task.id, task.context_id, pending)
+        return self._finish(
+            trace, name, answer, data, task.id, task.context_id, pending, remember=remember
+        )
 
     def _accept_lenient(self, parts: Any, trace: Trace) -> tuple[str, list[dict[str, Any]]]:
         """``_accept`` that never raises for refused kinds (they are traced, dropped)."""
@@ -1066,9 +1096,12 @@ class RemoteAgent:
         task_id: str,
         context_id: str,
         pending: str | None,
+        *,
+        remember: bool = True,
     ) -> Result:
         trace.add("result", status=status, task_id=task_id or None, parts=len(data))
-        self._remember(task_id, context_id)
+        if remember:
+            self._remember(task_id, context_id)
         return Result(
             status=status,
             answer=answer,

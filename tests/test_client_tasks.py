@@ -11,6 +11,7 @@ from conftest import TICKS
 
 from astromesh_a2a import (
     A2ATimeout,
+    BlockedDestination,
     Budget,
     Policy,
     PolicyRejected,
@@ -290,3 +291,91 @@ async def test_subscribe_sin_streaming_en_la_card(server, loopback):
         agent._card.capabilities.streaming = False  # as if the remote did not stream
         with pytest.raises(TaskFailed, match="streaming"):
             await _drain(agent.subscribe(submitted.task_id))
+
+
+# ---- review fixes: id validation, body/stream caps, listing hygiene ---------------------
+
+BAD_IDS = ["x" * 257, "a" + chr(10) + "b", "tab" + chr(9) + "here", "nul" + chr(0)]
+
+
+@pytest.mark.parametrize("bad", BAD_IDS)
+async def test_ids_invalidos_no_salen(server, loopback, bad):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        with pytest.raises(ValueError, match="context_id"):
+            await agent.send("hi", context_id=bad)
+        with pytest.raises(ValueError, match="context_id"):
+            await agent.submit("hi", context_id=bad)
+        with pytest.raises(ValueError, match="context_id"):
+            agent.stream("hi", context_id=bad)
+        with pytest.raises(ValueError, match="context_id"):
+            await agent.reply("t1", "hi", context_id=bad)
+        with pytest.raises(ValueError, match="context_id"):
+            await agent.list_tasks(context_id=bad)
+        with pytest.raises(ValueError, match="page_token"):
+            await agent.list_tasks(page_token=bad)
+        with pytest.raises(ValueError, match="task_id"):
+            await agent.reply(bad, "hi")
+        with pytest.raises(ValueError, match="task_id"):
+            await agent.get_task(bad)
+        with pytest.raises(ValueError, match="task_id"):
+            await agent.cancel(bad)
+        with pytest.raises(ValueError, match="task_id"):
+            agent.subscribe(bad)
+    assert server.requests == []  # nothing left, not even the card fetch
+
+
+async def test_send_context_id_vacio_sigue_valiendo(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        result = await agent.send("hello", context_id="")
+        longest = await agent.send("hello", context_id="c" * 256)
+    assert result.status == "completed"
+    assert longest.context_id == "c" * 256
+
+
+async def test_get_task_y_list_tasks_respetan_max_bytes(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        done = await agent.send("huge")  # one 6000-byte artifact
+    async with RemoteAgent(server.base, policy=_policy(max_bytes=4096)) as small:
+        with pytest.raises(BlockedDestination, match="4096"):
+            await small.get_task(done.task_id)
+        with pytest.raises(BlockedDestination, match="4096"):
+            await small.list_tasks(context_id=done.context_id)
+
+
+async def test_subscribe_respeta_max_stream_bytes(server, loopback):
+    policy = _policy(max_bytes=4096, max_stream_bytes=8192)
+    async with RemoteAgent(server.base, policy=policy) as agent:
+        submitted = await agent.submit("bigslow")
+        with pytest.raises(BlockedDestination, match="8192"):
+            await _drain(agent.subscribe(submitted.task_id))
+
+
+async def test_list_tasks_no_toca_el_mapa_de_contextos(server, loopback):
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        asked = await agent.send("ask")
+        agent._contexts.clear()
+        page = await agent.list_tasks(context_id=asked.context_id)
+        assert [r.task_id for r in page.tasks] == [asked.task_id]
+        assert agent._contexts == {}  # listing never evicts or adds pending contexts
+        await agent.get_task(asked.task_id)
+        assert agent._contexts == {asked.task_id: asked.context_id}
+
+
+async def test_list_tasks_descarta_estado_desconocido(server, loopback, monkeypatch):
+    from a2a.types import TaskState
+
+    async with RemoteAgent(server.base, policy=_policy()) as agent:
+        first = await agent.send("one")
+        await agent.send("two", context_id=first.context_id)
+        client = agent._sdk_client(streaming=False)
+        original = client.list_tasks
+
+        async def corrupt(request, *, context=None):
+            page = await original(request, context=context)
+            page.tasks[0].status.state = TaskState.TASK_STATE_UNSPECIFIED
+            return page
+
+        monkeypatch.setattr(client, "list_tasks", corrupt)
+        page = await agent.list_tasks(context_id=first.context_id)
+    assert len(page.tasks) == 1
+    assert any(e["stage"] == "rejection" and e.get("reason") == "unknown_state" for e in page.trace)

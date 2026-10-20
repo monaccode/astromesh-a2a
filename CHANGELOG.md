@@ -27,6 +27,21 @@ All notable changes to this project are documented here. The format follows
   server, still bounded by `handler_timeout`), `GetTask`, `ListTasks` and
   `SubscribeToTask`, scoped per caller identity like `GetTask`/`CancelTask` (tested:
   another caller cannot get, list or subscribe to a task).
+- Ids the client sends (`task_id`, `context_id`, `page_token`) are checked before any
+  request: a str of at most 256 characters, no control characters, else `ValueError`
+  (`send()`/`stream()`/`submit()` still accept `context_id=""` as "none").
+
+### Changed
+
+- `tool_description()` (the default adapter tool description) also tells the model never
+  to answer a confirmation or approval on the user's behalf, like the Astromesh core's.
+
+### Compatibility
+
+- `send()` and `reply()` return the same statuses as in 0.1.0 (`completed`,
+  `input_required`, `auth_required`) and raise as before. The new `Result.status` values
+  (`submitted`, `working`, `failed`, `canceled`, `rejected`) only come from the task API
+  (`submit()`, `get_task()`, `list_tasks()`).
 
 ## [0.1.0] - 2026-10-19
 
